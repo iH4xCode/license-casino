@@ -2,8 +2,11 @@ require('dotenv').config();
 
 const jwtSecret = process.env.JWT_SECRET;
 const dbUrl = process.env.DATABASE_URL;
+<<<<<<< HEAD
 const adminUsername = process.env.ADMIN_USERNAME;
 const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
+=======
+>>>>>>> 5a36c5f (Initial commit)
 
 const express = require("express");
 const sqlite3 = require("sqlite3").verbose();
@@ -12,9 +15,18 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
 const app = express();
+<<<<<<< HEAD
 const PORT = process.env.PORT || 5000;
 const DB_FILE = process.env.DB_FILE || "licenses.db";
 const SECRET_KEY = process.env.SECRET_KEY; // Ensure this is set in your .env file
+=======
+const PORT = 5000;
+const DB_FILE = "licenses.db";
+const SECRET_KEY = "Ayeshako@890"; // Change this to a secure secret
+const adminUsername = "hexcode";
+const adminPasswordHash = "$2b$10$S1JV/QQeNK130VAx1DN7zuS51YfFENb3EJUepL8ChWcxJUFcHGb5y"; // Hashed password
+
+>>>>>>> 5a36c5f (Initial commit)
 
 app.use(cors());
 app.use(express.json());
@@ -73,6 +85,10 @@ app.post("/admin-login", async (req, res) => {
     return res.json({ token });
 });
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> 5a36c5f (Initial commit)
 // ✅ Add license (Admin only) with hashing and expiration
 app.post("/add-license", verifyAdmin, async (req, res) => {
     const { license_key } = req.body;
@@ -134,4 +150,8 @@ app.post("/validate-license", (req, res) => {
 // Start server
 app.listen(PORT, () => {
     console.log(`✅ Server running on http://localhost:${PORT}`);
+<<<<<<< HEAD
 });
+=======
+});
+>>>>>>> 5a36c5f (Initial commit)
