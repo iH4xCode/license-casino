@@ -6,7 +6,7 @@ const adminUsername = process.env.ADMIN_USERNAME;
 const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
 
 const express = require("express");
-const sqlite3 = require("sqlite3").verbose();
+const sqlite3 = require("better-sqlite3").verbose();
 const cors = require("cors");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
