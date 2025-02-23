@@ -90,21 +90,14 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
         const expiresAt = new Date();
         expiresAt.setDate(expiresAt.getDate() + 30); // Set expiration to 30 days
 
-        db.run(
-            "INSERT INTO licenses (license_key, device_id, expires_at) VALUES (?, NULL, ?)",
-            [hashedKey, expiresAt.toISOString()],
-            function (err) {
-                if (err) {
-                    console.error("Database error:", err.message);
-                    return res.status(500).json({ message: "Database error" });
-                }
+        // Use prepare and run correctly for better-sqlite3
+        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at) VALUES (?, NULL, ?)");
+        stmt.run(hashedKey, expiresAt.toISOString());  // Execute the query
 
-                console.log(`License key added with ID ${this.lastID}`);
-                return res.json({ message: "License key added successfully", expires_at: expiresAt });
-            }
-        );
+        console.log("License key added successfully.");
+        return res.json({ message: "License key added successfully", expires_at: expiresAt });
     } catch (error) {
-        console.error("Error hashing license key:", error);
+        console.error("Error hashing license key:", error); // Log the actual error
         return res.status(500).json({ message: "Error hashing license key" });
     }
 });
@@ -118,35 +111,50 @@ app.post("/validate-license", async (req, res) => {
     }
 
     try {
-        // Fetch license by license_key from the database
-        const license = db.prepare("SELECT * FROM licenses WHERE license_key = ?").get(license_key);
+        // Prepare the query to fetch all licenses
+        const stmt = db.prepare("SELECT * FROM licenses");
+        const rows = stmt.all();  // Use .all() to fetch all rows synchronously
 
-        if (!license) {
+        let validLicense = null;
+
+        // Iterate through all licenses to find a match
+        for (const row of rows) {
+            // Compare the provided license key with the stored hash
+            const isMatch = await bcrypt.compare(license_key, row.license_key);
+            if (isMatch) {
+                validLicense = row;
+                break;
+            }
+        }
+
+        if (!validLicense) {
             return res.status(404).json({ valid: false, message: "License is invalid" });
         }
 
         // Check if license is expired
-        if (new Date(license.expires_at) < new Date()) {
+        if (new Date(validLicense.expires_at) < new Date()) {
             return res.status(403).json({ valid: false, message: "License expired" });
         }
 
         // Check if license is already in use by another device
-        if (license.device_id && license.device_id !== device_id) {
+        if (validLicense.device_id && validLicense.device_id !== device_id) {
             return res.status(403).json({ valid: false, message: "License already in use by another device" });
         }
 
         // Bind the license to the device if it's not already bound
-        if (!license.device_id) {
-            db.prepare("UPDATE licenses SET device_id = ? WHERE id = ?").run(device_id, license.id);
+        if (!validLicense.device_id) {
+            const updateStmt = db.prepare("UPDATE licenses SET device_id = ? WHERE id = ?");
+            updateStmt.run(device_id, validLicense.id); // Run the update query synchronously
+            return res.json({ valid: true, message: "Successfully Entered Valid License Expired in 30 days!" });
+        } else {
+            return res.json({ valid: true, message: "Successfully Entered Valid License Expired in 30 days!" });
         }
-
-        return res.json({ valid: true, message: "License is valid" });
-
     } catch (error) {
         console.error("Error during license validation:", error);
         return res.status(500).json({ valid: false, message: "Internal server error" });
     }
 });
+
 
 // Start server
 app.listen(PORT, () => {
