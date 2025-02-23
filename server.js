@@ -21,24 +21,23 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
 // Initialize database
-const db = new sqlite3.Database(DB_FILE, (err) => {
-    if (err) {
-        console.error("Error opening database:", err.message);
-    } else {
-        db.run(
-            `CREATE TABLE IF NOT EXISTS licenses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                license_key TEXT NOT NULL,
-                device_id TEXT,
-                expires_at TEXT
-            )`,
-            (err) => {
-                if (err) console.error("Error creating table:", err.message);
-                else console.log("✅ Database initialized.");
-            }
-        );
-    }
-});
+const db = new sqlite3(DB_FILE);
+
+try {
+    // Create table if it doesn't exist
+    const createTableStmt = `
+        CREATE TABLE IF NOT EXISTS licenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_key TEXT NOT NULL,
+            device_id TEXT,
+            expires_at TEXT
+        )
+    `;
+    db.prepare(createTableStmt).run();
+    console.log("✅ Database initialized.");
+} catch (err) {
+    console.error("Error initializing database:", err.message);
+}
 
 // Middleware to verify admin token
 function verifyAdmin(req, res, next) {
@@ -119,55 +118,30 @@ app.post("/validate-license", async (req, res) => {
     }
 
     try {
-        // Fetch all licenses from the database
-        db.all("SELECT * FROM licenses", async (err, rows) => {
-            if (err) {
-                console.error("Database error:", err.message);
-                return res.status(500).json({ valid: false, message: "Database error" });
-            }
+        // Fetch license by license_key from the database
+        const license = db.prepare("SELECT * FROM licenses WHERE license_key = ?").get(license_key);
 
-            let validLicense = null;
+        if (!license) {
+            return res.status(404).json({ valid: false, message: "License is invalid" });
+        }
 
-            // Iterate through all licenses to find a match
-            for (const row of rows) {
-                const isMatch = await bcrypt.compare(license_key, row.license_key);
-                if (isMatch) {
-                    validLicense = row;
-                    break;
-                }
-            }
+        // Check if license is expired
+        if (new Date(license.expires_at) < new Date()) {
+            return res.status(403).json({ valid: false, message: "License expired" });
+        }
 
-            if (!validLicense) {
-                return res.status(404).json({ valid: false, message: "License is invalid" });
-            }
+        // Check if license is already in use by another device
+        if (license.device_id && license.device_id !== device_id) {
+            return res.status(403).json({ valid: false, message: "License already in use by another device" });
+        }
 
-            // Check if license is expired
-            if (new Date(validLicense.expires_at) < new Date()) {
-                return res.status(403).json({ valid: false, message: "License expired" });
-            }
+        // Bind the license to the device if it's not already bound
+        if (!license.device_id) {
+            db.prepare("UPDATE licenses SET device_id = ? WHERE id = ?").run(device_id, license.id);
+        }
 
-            // Check if license is already in use by another device
-            if (validLicense.device_id && validLicense.device_id !== device_id) {
-                return res.status(403).json({ valid: false, message: "License already in use by another device" });
-            }
+        return res.json({ valid: true, message: "License is valid" });
 
-            // Bind the license to the device if it's not already bound
-            if (!validLicense.device_id) {
-                db.run(
-                    "UPDATE licenses SET device_id = ? WHERE id = ?",
-                    [device_id, validLicense.id],
-                    (err) => {
-                        if (err) {
-                            console.error("Database error:", err.message);
-                            return res.status(500).json({ valid: false, message: "Database error" });
-                        }
-                        return res.json({ valid: true, message: "License is valid" });
-                    }
-                );
-            } else {
-                return res.json({ valid: true, message: "License is valid" });
-            }
-        });
     } catch (error) {
         console.error("Error during license validation:", error);
         return res.status(500).json({ valid: false, message: "Internal server error" });
