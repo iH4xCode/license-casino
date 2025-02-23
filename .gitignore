@@ -4,6 +4,10 @@
 # Ignore node_modules
 node_modules/
 
+# Ignore SQLite database files (if needed)
+*.db
+*.db-journal
+
 # Ignore other sensitive files
 *.log
 *.key
