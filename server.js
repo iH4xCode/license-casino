@@ -2,11 +2,8 @@ require('dotenv').config();
 
 const jwtSecret = process.env.JWT_SECRET;
 const dbUrl = process.env.DATABASE_URL;
-<<<<<<< HEAD
 const adminUsername = process.env.ADMIN_USERNAME;
 const adminPasswordHash = process.env.ADMIN_PASSWORD_HASH;
-=======
->>>>>>> 5a36c5f (Initial commit)
 
 const express = require("express");
 const sqlite3 = require("sqlite3").verbose();
@@ -15,18 +12,9 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 
 const app = express();
-<<<<<<< HEAD
 const PORT = process.env.PORT || 5000;
 const DB_FILE = process.env.DB_FILE || "licenses.db";
 const SECRET_KEY = process.env.SECRET_KEY; // Ensure this is set in your .env file
-=======
-const PORT = 5000;
-const DB_FILE = "licenses.db";
-const SECRET_KEY = "Ayeshako@890"; // Change this to a secure secret
-const adminUsername = "hexcode";
-const adminPasswordHash = "$2b$10$S1JV/QQeNK130VAx1DN7zuS51YfFENb3EJUepL8ChWcxJUFcHGb5y"; // Hashed password
-
->>>>>>> 5a36c5f (Initial commit)
 
 app.use(cors());
 app.use(express.json());
@@ -76,19 +64,20 @@ app.post("/admin-login", async (req, res) => {
         return res.status(401).json({ message: "Invalid username" });
     }
 
-    const isPasswordCorrect = await bcrypt.compare(password, adminPasswordHash);
-    if (!isPasswordCorrect) {
-        return res.status(401).json({ message: "Invalid password" });
-    }
+    try {
+        const isPasswordCorrect = await bcrypt.compare(password, adminPasswordHash);
+        if (!isPasswordCorrect) {
+            return res.status(401).json({ message: "Invalid password" });
+        }
 
-    const token = jwt.sign({ role: "admin" }, SECRET_KEY, { expiresIn: "1h" });
-    return res.json({ token });
+        const token = jwt.sign({ role: "admin" }, SECRET_KEY, { expiresIn: "1h" });
+        return res.json({ token });
+    } catch (error) {
+        console.error("Error during admin login:", error);
+        return res.status(500).json({ message: "Internal server error" });
+    }
 });
 
-<<<<<<< HEAD
-=======
-
->>>>>>> 5a36c5f (Initial commit)
 // ✅ Add license (Admin only) with hashing and expiration
 app.post("/add-license", verifyAdmin, async (req, res) => {
     const { license_key } = req.body;
@@ -98,60 +87,94 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
 
     try {
         const hashedKey = await bcrypt.hash(license_key, 10); // Hash the license key
+        console.log("Hashed License Key before storing:", hashedKey); // Log the hashed key for debugging
         const expiresAt = new Date();
         expiresAt.setDate(expiresAt.getDate() + 30); // Set expiration to 30 days
 
         db.run(
             "INSERT INTO licenses (license_key, device_id, expires_at) VALUES (?, NULL, ?)",
             [hashedKey, expiresAt.toISOString()],
-            (err) => {
-                if (err) return res.status(500).json({ message: "Database error" });
+            function (err) {
+                if (err) {
+                    console.error("Database error:", err.message);
+                    return res.status(500).json({ message: "Database error" });
+                }
 
+                console.log(`License key added with ID ${this.lastID}`);
                 return res.json({ message: "License key added successfully", expires_at: expiresAt });
             }
         );
     } catch (error) {
+        console.error("Error hashing license key:", error);
         return res.status(500).json({ message: "Error hashing license key" });
     }
 });
 
+
 // ✅ Validate License
-app.post("/validate-license", (req, res) => {
+app.post("/validate-license", async (req, res) => {
     const { license_key, device_id } = req.body;
     if (!license_key || !device_id) {
         return res.status(400).json({ valid: false, message: "Missing data" });
     }
 
-    db.get("SELECT * FROM licenses WHERE device_id IS NULL", [], async (err, row) => {
-        if (err) return res.status(500).json({ valid: false, message: "Database error" });
+    try {
+        // Fetch all licenses from the database
+        db.all("SELECT * FROM licenses", async (err, rows) => {
+            if (err) {
+                console.error("Database error:", err.message);
+                return res.status(500).json({ valid: false, message: "Database error" });
+            }
 
-        if (!row) return res.status(404).json({ valid: false, message: "License not found" });
+            let validLicense = null;
 
-        // Check if license is expired
-        if (new Date(row.expires_at) < new Date()) {
-            return res.status(403).json({ valid: false, message: "License expired" });
-        }
+            // Iterate through all licenses to find a match
+            for (const row of rows) {
+                const isMatch = await bcrypt.compare(license_key, row.license_key);
+                if (isMatch) {
+                    validLicense = row;
+                    break;
+                }
+            }
 
-        // Compare hashed key
-        const isMatch = await bcrypt.compare(license_key, row.license_key);
-        if (!isMatch) {
-            return res.status(403).json({ valid: false, message: "Invalid license key" });
-        }
+            if (!validLicense) {
+                return res.status(404).json({ valid: false, message: "License is invalid" });
+            }
 
-        // 🔹 Bind the first valid license to a device
-        if (!row.device_id) {
-            db.run("UPDATE licenses SET device_id = ? WHERE license_key = ?", [device_id, row.license_key]);
-        }
+            // Check if license is expired
+            if (new Date(validLicense.expires_at) < new Date()) {
+                return res.status(403).json({ valid: false, message: "License expired" });
+            }
 
-        return res.json({ valid: true, message: "License is valid" });
-    });
+            // Check if license is already in use by another device
+            if (validLicense.device_id && validLicense.device_id !== device_id) {
+                return res.status(403).json({ valid: false, message: "License already in use by another device" });
+            }
+
+            // Bind the license to the device if it's not already bound
+            if (!validLicense.device_id) {
+                db.run(
+                    "UPDATE licenses SET device_id = ? WHERE id = ?",
+                    [device_id, validLicense.id],
+                    (err) => {
+                        if (err) {
+                            console.error("Database error:", err.message);
+                            return res.status(500).json({ valid: false, message: "Database error" });
+                        }
+                        return res.json({ valid: true, message: "License is valid" });
+                    }
+                );
+            } else {
+                return res.json({ valid: true, message: "License is valid" });
+            }
+        });
+    } catch (error) {
+        console.error("Error during license validation:", error);
+        return res.status(500).json({ valid: false, message: "Internal server error" });
+    }
 });
 
 // Start server
 app.listen(PORT, () => {
     console.log(`✅ Server running on http://localhost:${PORT}`);
-<<<<<<< HEAD
 });
-=======
-});
->>>>>>> 5a36c5f (Initial commit)
