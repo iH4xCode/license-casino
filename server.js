@@ -28,7 +28,7 @@ try {
     const createTableStmt = `
         CREATE TABLE IF NOT EXISTS licenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            license_key TEXT NOT NULL,
+            license_key TEXT NOT NULL UNIQUE,
             device_hash TEXT,
             expires_at TEXT
         )
@@ -116,6 +116,25 @@ app.post("/activate", (req, res) => {
     db.prepare("UPDATE licenses SET device_hash = ? WHERE license_key = ?").run(device_hash, license_key);
 
     return res.json({ success: true, message: "License activated successfully" });
+});
+
+// ✅ Admin add license key
+app.post("/admin/add-license", verifyAdmin, (req, res) => {
+    const { license_key, expires_at } = req.body;
+
+    if (!license_key) {
+        return res.status(400).json({ success: false, message: "Missing license_key" });
+    }
+
+    try {
+        db.prepare("INSERT INTO licenses (license_key, expires_at) VALUES (?, ?)").run(
+            license_key,
+            expires_at || null
+        );
+        res.json({ success: true, message: "License added successfully" });
+    } catch (err) {
+        res.status(400).json({ success: false, message: "License already exists or error inserting" });
+    }
 });
 
 app.listen(PORT, () => {
