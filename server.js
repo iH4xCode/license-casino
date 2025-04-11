@@ -34,8 +34,7 @@ app.use(limiter); // Apply rate limiting to all requests
 const db = new sqlite3(DB_FILE);
 
 try {
-    const createTableStmt = `
-        CREATE TABLE IF NOT EXISTS licenses (
+    const createTableStmt = `CREATE TABLE IF NOT EXISTS licenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT NOT NULL,
             device_id TEXT,
