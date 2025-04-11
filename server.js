@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Initialize database
+// Initialize database with updated schema to include hardware fingerprint
 const db = new sqlite3(DB_FILE);
 
 try {
@@ -29,11 +29,16 @@ try {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT NOT NULL,
             device_id TEXT,
+            hardware_fingerprint TEXT,
+            security_data TEXT,
+            script_version TEXT,
+            activation_date TEXT,
+            last_validation_date TEXT,
             expires_at TEXT
         )
     `;
     db.prepare(createTableStmt).run();
-    console.log("✅ Database initialized.");
+    console.log("✅ Database initialized with hardware fingerprint support.");
 } catch (err) {
     console.error("Error initializing database:", err.message);
 }
@@ -76,7 +81,7 @@ app.post("/admin-login", async (req, res) => {
     }
 });
 
-// ✅ Add license (Admin only)
+// Add license (Admin only)
 app.post("/add-license", verifyAdmin, async (req, res) => {
     const { license_key } = req.body;
     if (!license_key) {
@@ -88,7 +93,7 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
         const expiresAt = new Date();
         expiresAt.setDate(expiresAt.getDate() + 30);
 
-        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at) VALUES (?, NULL, ?)");
+        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, hardware_fingerprint, expires_at) VALUES (?, NULL, NULL, ?)");
         stmt.run(hashedKey, expiresAt.toISOString());
 
         console.log("License key added successfully.");
@@ -99,14 +104,18 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
     }
 });
 
-// ✅ Validate License (Now locks to a single device)
+// Enhanced validate license endpoint with hardware fingerprint check
 app.post("/validate-license", async (req, res) => {
-    const { license_key, device_id } = req.body;
-    if (!license_key || !device_id) {
-        return res.status(400).json({ valid: false, message: "Missing data" });
+    const { license_key, device_id, hardware_fingerprint, security_data, script_version, verification_type } = req.body;
+    
+    if (!license_key || !device_id || !hardware_fingerprint) {
+        return res.status(400).json({ valid: false, message: "Missing required data" });
     }
 
     try {
+        // Log validation attempt for debugging
+        console.log(`🔍 License validation attempt - Device: ${device_id.substring(0, 10)}... | HW: ${hardware_fingerprint.substring(0, 10)}...`);
+        
         // Fetch the license directly from the database
         const stmt = db.prepare("SELECT * FROM licenses");
         const licenses = stmt.all();
@@ -130,25 +139,120 @@ app.post("/validate-license", async (req, res) => {
             return res.status(403).json({ valid: false, message: "License expired" });
         }
 
-        // Prevent reuse on another device
-        if (validLicense.device_id && validLicense.device_id !== device_id) {
-            console.log(`⛔ License key already used on another device: ${validLicense.device_id}`);
-            return res.status(403).json({ valid: false, message: "License already in use by another device" });
-        }
+        // Store current date for logging
+        const currentDate = new Date().toISOString();
 
-        // Bind the license to the first device that registers it
-        if (!validLicense.device_id) {
-            const updateStmt = db.prepare("UPDATE licenses SET device_id = ? WHERE id = ?");
-            updateStmt.run(device_id, validLicense.id);
-            console.log(`✅ License key bound to device: ${device_id}`);
-            return res.json({ valid: true, message: "License activated on this device", expires_at: validLicense.expires_at });
+        // CASE 1: First-time activation (license not yet bound to any device)
+        if (!validLicense.device_id && !validLicense.hardware_fingerprint) {
+            console.log(`✅ First activation of license - binding to device: ${device_id.substring(0, 10)}... and HW: ${hardware_fingerprint.substring(0, 10)}...`);
+            
+            const updateStmt = db.prepare(`
+                UPDATE licenses 
+                SET device_id = ?, 
+                    hardware_fingerprint = ?, 
+                    security_data = ?,
+                    script_version = ?,
+                    activation_date = ?,
+                    last_validation_date = ?
+                WHERE id = ?
+            `);
+            
+            updateStmt.run(
+                device_id, 
+                hardware_fingerprint, 
+                security_data,
+                script_version,
+                currentDate,
+                currentDate,
+                validLicense.id
+            );
+            
+            return res.json({ 
+                valid: true, 
+                message: "License activated on this device", 
+                expires_at: validLicense.expires_at 
+            });
         }
-
-        return res.json({ valid: true, message: "License validated", expires_at: validLicense.expires_at });
+        
+        // CASE 2: Device ID and fingerprint match (valid use on registered device)
+        if (validLicense.device_id === device_id && validLicense.hardware_fingerprint === hardware_fingerprint) {
+            // Update last validation date
+            const updateStmt = db.prepare("UPDATE licenses SET last_validation_date = ? WHERE id = ?");
+            updateStmt.run(currentDate, validLicense.id);
+            
+            console.log(`✅ Valid license check from registered device: ${device_id.substring(0, 10)}...`);
+            return res.json({ 
+                valid: true, 
+                message: "License validated", 
+                expires_at: validLicense.expires_at 
+            });
+        }
+        
+        // CASE 3: License is being used on a different device
+        console.log(`⛔ License key used on unauthorized device - Registered: ${validLicense.device_id.substring(0, 10)}... | HW: ${validLicense.hardware_fingerprint.substring(0, 10)}...`);
+        console.log(`⛔ Attempt from: ${device_id.substring(0, 10)}... | HW: ${hardware_fingerprint.substring(0, 10)}...`);
+        
+        return res.status(403).json({ 
+            valid: false, 
+            message: "License is already activated on another device and cannot be transferred" 
+        });
+        
     } catch (error) {
         console.error("Error during license validation:", error);
         return res.status(500).json({ valid: false, message: "Internal server error" });
     }
+});
+
+// Get license information (Admin only)
+app.get("/admin/licenses", verifyAdmin, (req, res) => {
+    try {
+        const stmt = db.prepare("SELECT * FROM licenses");
+        const licenses = stmt.all();
+        return res.json({ licenses });
+    } catch (error) {
+        console.error("Error fetching licenses:", error);
+        return res.status(500).json({ message: "Error fetching licenses" });
+    }
+});
+
+// Revoke license (Admin only)
+app.post("/admin/revoke-license", verifyAdmin, async (req, res) => {
+    const { license_key } = req.body;
+    if (!license_key) {
+        return res.status(400).json({ message: "License key required" });
+    }
+
+    try {
+        const stmt = db.prepare("SELECT * FROM licenses");
+        const licenses = stmt.all();
+
+        let licenseId = null;
+        
+        for (const license of licenses) {
+            const isMatch = await bcrypt.compare(license_key, license.license_key);
+            if (isMatch) {
+                licenseId = license.id;
+                break;
+            }
+        }
+
+        if (!licenseId) {
+            return res.status(404).json({ message: "License not found" });
+        }
+
+        const updateStmt = db.prepare("UPDATE licenses SET device_id = NULL, hardware_fingerprint = NULL WHERE id = ?");
+        updateStmt.run(licenseId);
+
+        return res.json({ message: "License revoked successfully" });
+    } catch (error) {
+        console.error("Error revoking license:", error);
+        return res.status(500).json({ message: "Error revoking license" });
+    }
+});
+
+// Health check endpoint
+app.get("/health", (req, res) => {
+    return res.json({ status: "ok", message: "License server is running" });
 });
 
 // Start server
