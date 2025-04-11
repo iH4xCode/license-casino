@@ -18,6 +18,7 @@ const DB_FILE = process.env.DB_FILE || "licenses.db";
 const SECRET_KEY = process.env.SECRET_KEY;
 
 app.use(cors());
+app.use(express.json());  // ✅ Added JSON body parsing
 app.use(express.json());  // ✅ Enable JSON body parsing
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
@@ -111,7 +112,8 @@ app.post("/activate", (req, res) => {
         console.log(`✅ Activated license ${license} for device ${deviceId} / fp ${fingerprint}`);
         res.json({ success: true });
     } catch (err) {
-        res.status(500).json({ error: "Activation failed" });
+        console.error("❌ Activation failed:", err);
+    res.status(500).json({ error: "Activation failed" });
     }
 });
 
