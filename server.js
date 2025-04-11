@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 
 const jwtSecret = process.env.JWT_SECRET;
@@ -29,129 +30,114 @@ try {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT NOT NULL,
             device_id TEXT,
+            fingerprint TEXT,
             expires_at TEXT
         )
     `;
     db.prepare(createTableStmt).run();
-    console.log("✅ Database initialized.");
-} catch (err) {
-    console.error("Error initializing database:", err.message);
+    console.log("✅ License table is ready.");
+} catch (error) {
+    console.error("❌ Failed to initialize database:", error);
 }
 
-// Middleware to verify admin token
-function verifyAdmin(req, res, next) {
-    const token = req.headers.authorization?.split(" ")[1];
-    if (!token) return res.status(401).json({ message: "Access denied. No token provided." });
-
-    try {
-        const decoded = jwt.verify(token, SECRET_KEY);
-        if (decoded.role !== "admin") {
-            return res.status(403).json({ message: "Access denied. Not an admin." });
-        }
-        next();
-    } catch (error) {
-        res.status(400).json({ message: "Invalid token." });
-    }
-}
-
-// Admin login to get a token
-app.post("/admin-login", async (req, res) => {
+// Admin login
+app.post("/admin-login", (req, res) => {
     const { username, password } = req.body;
 
-    if (username !== adminUsername) {
-        return res.status(401).json({ message: "Invalid username" });
-    }
-
-    try {
-        const isPasswordCorrect = await bcrypt.compare(password, adminPasswordHash);
-        if (!isPasswordCorrect) {
-            return res.status(401).json({ message: "Invalid password" });
-        }
-
-        const token = jwt.sign({ role: "admin" }, SECRET_KEY, { expiresIn: "1h" });
-        return res.json({ token });
-    } catch (error) {
-        console.error("Error during admin login:", error);
-        return res.status(500).json({ message: "Internal server error" });
+    if (username === adminUsername && bcrypt.compareSync(password, adminPasswordHash)) {
+        const token = jwt.sign({ username }, jwtSecret, { expiresIn: "2h" });
+        res.json({ token });
+    } else {
+        res.status(401).json({ error: "Invalid credentials" });
     }
 });
 
-// ✅ Add license (Admin only)
-app.post("/add-license", verifyAdmin, async (req, res) => {
-    const { license_key } = req.body;
-    if (!license_key) {
-        return res.status(400).json({ message: "License key required" });
+// Add license (admin only)
+app.post("/add-license", (req, res) => {
+    const authHeader = req.headers.authorization;
+
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Missing token" });
     }
 
+    const token = authHeader.split(" ")[1];
     try {
-        const hashedKey = await bcrypt.hash(license_key, 10);
-        const expiresAt = new Date();
-        expiresAt.setDate(expiresAt.getDate() + 30);
+        jwt.verify(token, jwtSecret);
+    } catch (err) {
+        return res.status(403).json({ error: "Invalid token" });
+    }
 
-        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at) VALUES (?, NULL, ?)");
-        stmt.run(hashedKey, expiresAt.toISOString());
+    const { license, expiresAt } = req.body;
 
-        console.log("License key added successfully.");
-        return res.json({ message: "License key added successfully", expires_at: expiresAt });
-    } catch (error) {
-        console.error("Error adding license:", error);
-        return res.status(500).json({ message: "Error adding license" });
+    if (!license) return res.status(400).json({ error: "License is required" });
+
+    try {
+        const existing = db.prepare("SELECT * FROM licenses WHERE license_key = ?").get(license);
+        if (existing) {
+            return res.status(400).json({ error: "License already exists" });
+        }
+
+        const insert = db.prepare("INSERT INTO licenses (license_key, expires_at) VALUES (?, ?)");
+        insert.run(license, expiresAt || null);
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Failed to add license" });
     }
 });
 
-// ✅ Validate License (Now locks to a single device)
-app.post("/validate-license", async (req, res) => {
-    const { license_key, device_id } = req.body;
-    if (!license_key || !device_id) {
-        return res.status(400).json({ valid: false, message: "Missing data" });
+// ✅ Activate license (bind to fingerprint + deviceId)
+app.post("/activate", (req, res) => {
+    const { license, fingerprint, deviceId } = req.body;
+
+    if (!license || !fingerprint || !deviceId) {
+        return res.status(400).json({ error: "Missing required fields" });
     }
 
     try {
-        // Fetch the license directly from the database
-        const stmt = db.prepare("SELECT * FROM licenses");
-        const licenses = stmt.all();
-
-        let validLicense = null;
-
-        for (const license of licenses) {
-            const isMatch = await bcrypt.compare(license_key, license.license_key);
-            if (isMatch) {
-                validLicense = license;
-                break;
-            }
+        const existing = db.prepare("SELECT * FROM licenses WHERE license_key = ?").get(license);
+        if (!existing) {
+            return res.status(404).json({ error: "License not found" });
         }
 
-        if (!validLicense) {
-            return res.status(404).json({ valid: false, message: "License is invalid" });
+        if (existing.device_id || existing.fingerprint) {
+            return res.status(400).json({ error: "License already activated" });
         }
 
-        // Check if license is expired
-        if (new Date(validLicense.expires_at) < new Date()) {
-            return res.status(403).json({ valid: false, message: "License expired" });
-        }
+        const update = db.prepare("UPDATE licenses SET device_id = ?, fingerprint = ? WHERE license_key = ?");
+        update.run(deviceId, fingerprint, license);
 
-        // Prevent reuse on another device
-        if (validLicense.device_id && validLicense.device_id !== device_id) {
-            console.log(`⛔ License key already used on another device: ${validLicense.device_id}`);
-            return res.status(403).json({ valid: false, message: "License already in use by another device" });
-        }
-
-        // Bind the license to the first device that registers it
-        if (!validLicense.device_id) {
-            const updateStmt = db.prepare("UPDATE licenses SET device_id = ? WHERE id = ?");
-            updateStmt.run(device_id, validLicense.id);
-            console.log(`✅ License key bound to device: ${device_id}`);
-            return res.json({ valid: true, message: "License activated on this device", expires_at: validLicense.expires_at });
-        }
-
-        return res.json({ valid: true, message: "License validated", expires_at: validLicense.expires_at });
-    } catch (error) {
-        console.error("Error during license validation:", error);
-        return res.status(500).json({ valid: false, message: "Internal server error" });
+        console.log(`✅ Activated license ${license} for device ${deviceId} / fp ${fingerprint}`);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: "Activation failed" });
     }
 });
 
-// Start server
+// 🔐 Validate license with fingerprint + memory-only deviceId
+app.get("/validate-license", (req, res) => {
+    const { license, fingerprint, deviceId } = req.query;
+
+    if (!license || !fingerprint || !deviceId) {
+        return res.status(400).json({ valid: false, error: "Missing fields" });
+    }
+
+    try {
+        const record = db.prepare("SELECT * FROM licenses WHERE license_key = ?").get(license);
+        if (!record) {
+            return res.status(404).json({ valid: false, error: "License not found" });
+        }
+
+        if (record.fingerprint !== fingerprint || record.device_id !== deviceId) {
+            return res.status(403).json({ valid: false, error: "Fingerprint or DeviceID mismatch" });
+        }
+
+        res.json({ valid: true });
+    } catch (err) {
+        res.status(500).json({ valid: false, error: "Validation error" });
+    }
+});
+
 app.listen(PORT, () => {
-    console.log(`✅ Server running on http://localhost:${PORT}`);
+    console.log(`🚀 License server running on http://localhost:${PORT}`);
 });
