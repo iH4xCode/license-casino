@@ -18,6 +18,7 @@ const DB_FILE = process.env.DB_FILE || "licenses.db";
 const SECRET_KEY = process.env.SECRET_KEY;
 
 app.use(cors());
+app.use(express.json());  // ✅ Enable JSON body parsing
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
