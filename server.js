@@ -50,13 +50,14 @@ try {
     `;
     db.prepare(createKeyRefTableStmt).run();
     
-    // Device signatures table
+    // Device signatures table (enhanced with script_manager field)
     const createSignaturesTableStmt = `
         CREATE TABLE IF NOT EXISTS device_signatures (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_id INTEGER NOT NULL,
             device_id TEXT NOT NULL,
             signature TEXT NOT NULL,
+            script_manager TEXT DEFAULT 'unknown',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (license_id) REFERENCES licenses (id)
@@ -73,11 +74,26 @@ try {
             old_signature TEXT,
             new_signature TEXT,
             action TEXT NOT NULL,
+            details TEXT,
             timestamp TEXT DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (license_id) REFERENCES licenses (id)
         )
     `;
     db.prepare(createSecurityLogTableStmt).run();
+    
+    // Backup detection table to track known backup attempts
+    const createBackupDetectionTableStmt = `
+        CREATE TABLE IF NOT EXISTS backup_detection (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_id INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            script_manager TEXT NOT NULL,
+            backup_signature TEXT NOT NULL,
+            detected_at TEXT DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (license_id) REFERENCES licenses (id)
+        )
+    `;
+    db.prepare(createBackupDetectionTableStmt).run();
     
     console.log("✅ Database initialized.");
 } catch (err) {
@@ -202,9 +218,9 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
     }
 });
 
-// ✅ Validate License (Now checks for revocation and updates activity status)
+// ✅ Validate License (Enhanced with script manager detection)
 app.post("/validate-license", async (req, res) => {
-    const { license_key, device_id, device_signature } = req.body;
+    const { license_key, device_id, device_signature, script_manager } = req.body;
     if (!license_key || !device_id) {
         return res.status(400).json({ valid: false, message: "Missing data" });
     }
@@ -257,37 +273,77 @@ app.post("/validate-license", async (req, res) => {
             if (!existingSignature) {
                 // No signature record exists yet, create one
                 const insertStmt = db.prepare(
-                    "INSERT INTO device_signatures (license_id, device_id, signature) VALUES (?, ?, ?)"
+                    "INSERT INTO device_signatures (license_id, device_id, signature, script_manager) VALUES (?, ?, ?, ?)"
                 );
-                insertStmt.run(validLicense.id, device_id, device_signature);
+                insertStmt.run(validLicense.id, device_id, device_signature, script_manager || "unknown");
                 console.log(`✅ Device signature recorded for license ID ${validLicense.id}`);
-            } else if (existingSignature.device_id === device_id && 
-                       existingSignature.signature !== device_signature) {
-                // Check signature similarity
-                const similarityScore = calculateSimilarity(existingSignature.signature, device_signature);
-                
-                if (similarityScore < 0.7) { // Below threshold
-                    console.log(`⛔ Possible unauthorized transfer detected during validation for license ${validLicense.id}`);
-                    console.log(`Similarity score: ${similarityScore}`);
+            } else {
+                // Check if script manager changed (backup detection)
+                if (script_manager && existingSignature.script_manager !== script_manager) {
+                    console.log(`⛔ Script manager changed from ${existingSignature.script_manager} to ${script_manager}`);
                     
-                    // Record this attempt
+                    // Log the backup attempt
                     const logStmt = db.prepare(
-                        "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action) VALUES (?, ?, ?, ?, ?)"
+                        "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action, details) VALUES (?, ?, ?, ?, ?, ?)"
                     );
-                    logStmt.run(validLicense.id, device_id, existingSignature.signature, device_signature, "validation_transfer_attempt");
+                    const details = JSON.stringify({
+                        old_manager: existingSignature.script_manager,
+                        new_manager: script_manager
+                    });
+                    logStmt.run(validLicense.id, device_id, existingSignature.signature, device_signature, "script_manager_change", details);
+                    
+                    // Record in backup detection
+                    const backupStmt = db.prepare(
+                        "INSERT INTO backup_detection (license_id, device_id, script_manager, backup_signature) VALUES (?, ?, ?, ?)"
+                    );
+                    backupStmt.run(validLicense.id, device_id, script_manager, device_signature);
                     
                     return res.status(403).json({
                         valid: false,
-                        message: "Unauthorized license transfer detected",
-                        unauthorized: true
+                        message: "Unauthorized script manager change detected",
+                        unauthorized: true,
+                        backup_detected: true
                     });
                 }
                 
-                // Signature is similar enough, update it
-                const updateSignatureStmt = db.prepare(
-                    "UPDATE device_signatures SET signature = ?, updated_at = ? WHERE id = ?"
-                );
-                updateSignatureStmt.run(device_signature, currentTime, existingSignature.id);
+                // If same script manager but signature different, check similarity
+                if (existingSignature.device_id === device_id && 
+                   existingSignature.signature !== device_signature) {
+                    // Check signature similarity
+                    const similarityScore = calculateSimilarity(existingSignature.signature, device_signature);
+                    
+                    if (similarityScore < 0.7) { // Below threshold
+                        console.log(`⛔ Possible unauthorized transfer detected during validation for license ${validLicense.id}`);
+                        console.log(`Similarity score: ${similarityScore}`);
+                        
+                        // Record this attempt
+                        const logStmt = db.prepare(
+                            "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action, details) VALUES (?, ?, ?, ?, ?, ?)"
+                        );
+                        const details = JSON.stringify({
+                            similarity_score: similarityScore,
+                            script_manager: script_manager
+                        });
+                        logStmt.run(validLicense.id, device_id, existingSignature.signature, device_signature, "validation_transfer_attempt", details);
+                        
+                        return res.status(403).json({
+                            valid: false,
+                            message: "Unauthorized license transfer detected",
+                            unauthorized: true
+                        });
+                    }
+                    
+                    // Signature is similar enough, update it
+                    const updateSignatureStmt = db.prepare(
+                        "UPDATE device_signatures SET signature = ?, script_manager = ?, updated_at = ? WHERE id = ?"
+                    );
+                    updateSignatureStmt.run(
+                        device_signature, 
+                        script_manager || existingSignature.script_manager, 
+                        currentTime, 
+                        existingSignature.id
+                    );
+                }
             }
         }
 
@@ -334,9 +390,9 @@ app.post("/validate-license", async (req, res) => {
     }
 });
 
-// ✅ Verify device for anti-backup protection
+// ✅ Verify device for anti-backup protection (Enhanced version)
 app.post("/verify-device", async (req, res) => {
-    const { license_key, device_id, device_signature } = req.body;
+    const { license_key, device_id, device_signature, script_manager } = req.body;
     
     if (!license_key || !device_id || !device_signature) {
         return res.status(400).json({ 
@@ -398,6 +454,22 @@ app.post("/verify-device", async (req, res) => {
             });
         }
         
+        // Check for existing backup detection
+        const backupStmt = db.prepare(
+            "SELECT * FROM backup_detection WHERE license_id = ? AND device_id = ? AND script_manager = ?"
+        );
+        const existingBackup = backupStmt.get(foundLicenseId, device_id, script_manager || "unknown");
+        
+        if (existingBackup) {
+            console.log(`⛔ Previously detected backup attempt for license ID ${foundLicenseId}`);
+            return res.status(403).json({
+                valid: false,
+                message: "Previously identified backup transfer",
+                unauthorized: true,
+                backup_detected: true
+            });
+        }
+        
         // Check device fingerprint in device signatures table
         const deviceSignatureStmt = db.prepare(
             "SELECT * FROM device_signatures WHERE license_id = ? LIMIT 1"
@@ -407,15 +479,43 @@ app.post("/verify-device", async (req, res) => {
         // If no device signature record exists yet, create one
         if (!existingSignature) {
             const insertStmt = db.prepare(
-                "INSERT INTO device_signatures (license_id, device_id, signature) VALUES (?, ?, ?)"
+                "INSERT INTO device_signatures (license_id, device_id, signature, script_manager) VALUES (?, ?, ?, ?)"
             );
-            insertStmt.run(foundLicenseId, device_id, device_signature);
+            insertStmt.run(foundLicenseId, device_id, device_signature, script_manager || "unknown");
             
             console.log(`✅ New device signature recorded for license ID ${foundLicenseId}`);
             
             return res.json({
                 valid: true,
                 message: "Device verified and registered"
+            });
+        }
+        
+        // Check if script manager changed
+        if (script_manager && existingSignature.script_manager !== script_manager) {
+            console.log(`⛔ Script manager change detected: ${existingSignature.script_manager} -> ${script_manager}`);
+            
+            // Record this attempt
+            const logStmt = db.prepare(
+                "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action, details) VALUES (?, ?, ?, ?, ?, ?)"
+            );
+            const details = JSON.stringify({
+                old_manager: existingSignature.script_manager,
+                new_manager: script_manager
+            });
+            logStmt.run(foundLicenseId, device_id, existingSignature.signature, device_signature, "script_manager_change_verify", details);
+            
+            // Add to backup detection
+            const backupInsertStmt = db.prepare(
+                "INSERT INTO backup_detection (license_id, device_id, script_manager, backup_signature) VALUES (?, ?, ?, ?)"
+            );
+            backupInsertStmt.run(foundLicenseId, device_id, script_manager, device_signature);
+            
+            return res.status(403).json({
+                valid: false,
+                message: "Script manager change detected - possible backup/export",
+                unauthorized: true,
+                backup_detected: true
             });
         }
         
@@ -435,9 +535,13 @@ app.post("/verify-device", async (req, res) => {
                 
                 // Record this attempt
                 const logStmt = db.prepare(
-                    "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action) VALUES (?, ?, ?, ?, ?)"
+                    "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action, details) VALUES (?, ?, ?, ?, ?, ?)"
                 );
-                logStmt.run(foundLicenseId, device_id, existingSignature.signature, device_signature, "transfer_attempt");
+                const details = JSON.stringify({
+                    similarity_score: similarityScore,
+                    script_manager: script_manager
+                });
+                logStmt.run(foundLicenseId, device_id, existingSignature.signature, device_signature, "transfer_attempt", details);
                 
                 return res.status(403).json({
                     valid: false,
@@ -448,9 +552,9 @@ app.post("/verify-device", async (req, res) => {
             
             // If signatures are similar enough, update the signature and allow
             const updateStmt = db.prepare(
-                "UPDATE device_signatures SET signature = ? WHERE license_id = ?"
+                "UPDATE device_signatures SET signature = ?, updated_at = ? WHERE license_id = ?"
             );
-            updateStmt.run(device_signature, foundLicenseId);
+            updateStmt.run(device_signature, new Date().toISOString(), foundLicenseId);
             
             console.log(`✅ Device signature updated for license ID ${foundLicenseId}`);
         }
@@ -465,9 +569,6 @@ app.post("/verify-device", async (req, res) => {
                     message: "License already bound to another device"
                 });
             }
-            
-            // Handle multi-device license case if needed
-            // This section would implement any business logic for multi-device licenses
         }
         
         return res.json({
@@ -483,9 +584,9 @@ app.post("/verify-device", async (req, res) => {
     }
 });
 
-// ✅ Heartbeat endpoint to keep a license marked as active (Updated for anti-backup)
+// ✅ Heartbeat endpoint to keep a license marked as active (Enhanced for script manager detection)
 app.post("/license-heartbeat", async (req, res) => {
-    const { license_key, device_id, device_signature } = req.body;
+    const { license_key, device_id, device_signature, script_manager } = req.body;
     if (!license_key || !device_id) {
         return res.status(400).json({ success: false, message: "Missing data" });
     }
@@ -532,6 +633,24 @@ app.post("/license-heartbeat", async (req, res) => {
             });
         }
         
+        // Check for known backup attempts
+        if (script_manager) {
+            const backupStmt = db.prepare(
+                "SELECT * FROM backup_detection WHERE license_id = ? AND device_id = ? AND script_manager = ?"
+            );
+            const existingBackup = backupStmt.get(foundLicense.id, device_id, script_manager);
+            
+            if (existingBackup) {
+                console.log(`⛔ Previously detected backup attempt during heartbeat for license ID ${foundLicense.id}`);
+                return res.status(403).json({
+                    success: false,
+                    message: "Previously identified backup transfer",
+                    unauthorized: true,
+                    backup_detected: true
+                });
+            }
+        }
+        
         // Check device signature if provided
         if (device_signature) {
             const deviceSignatureStmt = db.prepare(
@@ -540,6 +659,34 @@ app.post("/license-heartbeat", async (req, res) => {
             const existingSignature = deviceSignatureStmt.get(foundLicense.id);
             
             if (existingSignature) {
+                // Check for script manager change
+                if (script_manager && existingSignature.script_manager !== script_manager) {
+                    console.log(`⛔ Script manager change detected during heartbeat: ${existingSignature.script_manager} -> ${script_manager}`);
+                    
+                    // Log the script manager change
+                    const logStmt = db.prepare(
+                        "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action, details) VALUES (?, ?, ?, ?, ?, ?)"
+                    );
+                    const details = JSON.stringify({
+                        old_manager: existingSignature.script_manager,
+                        new_manager: script_manager
+                    });
+                    logStmt.run(foundLicense.id, device_id, existingSignature.signature, device_signature, "heartbeat_script_manager_change", details);
+                    
+                    // Record in backup detection
+                    const backupStmt = db.prepare(
+                        "INSERT INTO backup_detection (license_id, device_id, script_manager, backup_signature) VALUES (?, ?, ?, ?)"
+                    );
+                    backupStmt.run(foundLicense.id, device_id, script_manager, device_signature);
+                    
+                    return res.status(403).json({
+                        success: false,
+                        message: "Unauthorized script manager change detected",
+                        unauthorized: true,
+                        backup_detected: true
+                    });
+                }
+                
                 // If signatures don't match, this could be an unauthorized transfer
                 if (existingSignature.signature !== device_signature) {
                     const similarityScore = calculateSimilarity(existingSignature.signature, device_signature);
@@ -550,9 +697,13 @@ app.post("/license-heartbeat", async (req, res) => {
                         
                         // Record this attempt
                         const logStmt = db.prepare(
-                            "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action) VALUES (?, ?, ?, ?, ?)"
+                            "INSERT INTO security_log (license_id, device_id, old_signature, new_signature, action, details) VALUES (?, ?, ?, ?, ?, ?)"
                         );
-                        logStmt.run(foundLicense.id, device_id, existingSignature.signature, device_signature, "heartbeat_transfer_attempt");
+                        const details = JSON.stringify({
+                            similarity_score: similarityScore,
+                            script_manager: script_manager
+                        });
+                        logStmt.run(foundLicense.id, device_id, existingSignature.signature, device_signature, "heartbeat_transfer_attempt", details);
                         
                         return res.status(403).json({
                             success: false,
@@ -570,9 +721,9 @@ app.post("/license-heartbeat", async (req, res) => {
             } else {
                 // No signature record exists, create one
                 const insertStmt = db.prepare(
-                    "INSERT INTO device_signatures (license_id, device_id, signature) VALUES (?, ?, ?)"
+                    "INSERT INTO device_signatures (license_id, device_id, signature, script_manager) VALUES (?, ?, ?, ?)"
                 );
-                insertStmt.run(foundLicense.id, device_id, device_signature);
+                insertStmt.run(foundLicense.id, device_id, device_signature, script_manager || "unknown");
             }
         }
         
@@ -614,9 +765,11 @@ app.get("/monitor-licenses", verifyAdmin, async (req, res) => {
                    l.last_active,
                    l.active_status,
                    l.device_count,
-                   a.plain_key
+                   a.plain_key,
+                   d.script_manager
             FROM licenses l
             LEFT JOIN admin_license_keys a ON l.id = a.license_id
+            LEFT JOIN device_signatures d ON l.id = d.license_id
         `);
         const licenseData = licenseDataStmt.all();
         
@@ -637,6 +790,7 @@ app.get("/monitor-licenses", verifyAdmin, async (req, res) => {
                         license.active_status === 1 ? "online" : "offline",
                 device_id: license.device_id || "not_registered",
                 device_count: license.device_count || 0,
+                script_manager: license.script_manager || "unknown",
                 expires_at: license.expires_at,
                 last_active: license.last_active || "never",
             });
@@ -651,73 +805,4 @@ app.get("/monitor-licenses", verifyAdmin, async (req, res) => {
         console.error("Error during license monitoring:", error);
         return res.status(500).json({ message: "Internal server error" });
     }
-});
-
-// ✅ Get security log (Admin only)
-app.get("/security-log", verifyAdmin, async (req, res) => {
-    try {
-        const securityLogStmt = db.prepare(`
-            SELECT s.id, s.license_id, s.device_id, s.action, s.timestamp,
-                   a.plain_key as license_key
-            FROM security_log s
-            LEFT JOIN admin_license_keys a ON s.license_id = a.license_id
-            ORDER BY s.timestamp DESC
-            LIMIT 100
-        `);
-        const securityLogs = securityLogStmt.all();
-        
-        return res.json({
-            log_count: securityLogs.length,
-            logs: securityLogs
-        });
-    } catch (error) {
-        console.error("Error fetching security log:", error);
-        return res.status(500).json({ message: "Internal server error" });
-    }
-});
-
-// Helper function to calculate similarity between two strings (for device signatures)
-function calculateSimilarity(str1, str2) {
-    // Split the strings by the separator used in device signatures
-    const components1 = str1.split('::');
-    const components2 = str2.split('::');
-    
-    // Need at least some components to compare
-    if (!components1.length || !components2.length) {
-        return 0;
-    }
-    
-    // Count matching components
-    let matches = 0;
-    const minLength = Math.min(components1.length, components2.length);
-    
-    for (let i = 0; i < minLength; i++) {
-        // For the first component (deviceId), require exact match
-        if (i === 0 && components1[i] !== components2[i]) {
-            return 0; // Device ID must match exactly
-        }
-        
-        // For other components, check similarity
-        if (i > 0) {
-            const comp1 = components1[i];
-            const comp2 = components2[i];
-            
-            // For browser fingerprints, look for partial matches
-            if (comp1 === comp2) {
-                matches += 1;
-            } else if (comp1.includes(comp2) || comp2.includes(comp1)) {
-                matches += 0.5; // Partial match
-            }
-        } else {
-            // First component (device ID) already checked
-            matches += 1;
-        }
-    }
-    
-    return matches / minLength;
-}
-
-// Start server
-app.listen(PORT, () => {
-    console.log(`✅ Server running on http://localhost:${PORT}`);
 });
