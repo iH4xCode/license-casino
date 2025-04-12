@@ -29,7 +29,9 @@ try {
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT NOT NULL,
             device_id TEXT,
-            expires_at TEXT
+            expires_at TEXT,
+            revoked INTEGER DEFAULT 0,
+            revoked_at TEXT DEFAULT NULL
         )
     `;
     db.prepare(createTableStmt).run();
@@ -88,7 +90,7 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
         const expiresAt = new Date();
         expiresAt.setDate(expiresAt.getDate() + 30);
 
-        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at) VALUES (?, NULL, ?)");
+        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at, revoked) VALUES (?, NULL, ?, 0)");
         stmt.run(hashedKey, expiresAt.toISOString());
 
         console.log("License key added successfully.");
@@ -99,7 +101,47 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
     }
 });
 
-// ✅ Validate License (Now locks to a single device)
+// ✅ Revoke license (Admin only)
+app.post("/revoke-license", verifyAdmin, async (req, res) => {
+    const { license_key } = req.body;
+    if (!license_key) {
+        return res.status(400).json({ message: "License key required" });
+    }
+
+    try {
+        // Fetch all licenses
+        const stmt = db.prepare("SELECT * FROM licenses");
+        const licenses = stmt.all();
+        
+        let foundLicense = null;
+        
+        // Find the license by comparing with bcrypt
+        for (const license of licenses) {
+            const isMatch = await bcrypt.compare(license_key, license.license_key);
+            if (isMatch) {
+                foundLicense = license;
+                break;
+            }
+        }
+        
+        if (!foundLicense) {
+            return res.status(404).json({ message: "License not found" });
+        }
+        
+        // Update the license to revoked status
+        const revokedAt = new Date().toISOString();
+        const updateStmt = db.prepare("UPDATE licenses SET revoked = 1, revoked_at = ? WHERE id = ?");
+        updateStmt.run(revokedAt, foundLicense.id);
+        
+        console.log(`⛔ License key revoked: ID ${foundLicense.id}`);
+        return res.json({ message: "License revoked successfully" });
+    } catch (error) {
+        console.error("Error revoking license:", error);
+        return res.status(500).json({ message: "Error revoking license" });
+    }
+});
+
+// ✅ Validate License (Now checks for revocation)
 app.post("/validate-license", async (req, res) => {
     const { license_key, device_id } = req.body;
     if (!license_key || !device_id) {
@@ -123,6 +165,12 @@ app.post("/validate-license", async (req, res) => {
 
         if (!validLicense) {
             return res.status(404).json({ valid: false, message: "License is invalid" });
+        }
+        
+        // Check if license is revoked
+        if (validLicense.revoked === 1) {
+            console.log(`⛔ License key has been revoked at ${validLicense.revoked_at}`);
+            return res.status(403).json({ valid: false, message: "License has been revoked", revoked: true });
         }
 
         // Check if license is expired
