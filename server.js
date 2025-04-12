@@ -24,6 +24,7 @@ app.use(express.urlencoded({ extended: true }));
 const db = new sqlite3(DB_FILE);
 
 try {
+    // Main licenses table
     const createTableStmt = `
         CREATE TABLE IF NOT EXISTS licenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -38,6 +39,17 @@ try {
         )
     `;
     db.prepare(createTableStmt).run();
+    
+    // Create admin key reference table
+    const createKeyRefTableStmt = `
+        CREATE TABLE IF NOT EXISTS admin_license_keys (
+            license_id INTEGER PRIMARY KEY,
+            plain_key TEXT NOT NULL,
+            FOREIGN KEY (license_id) REFERENCES licenses (id)
+        )
+    `;
+    db.prepare(createKeyRefTableStmt).run();
+    
     console.log("✅ Database initialized.");
 } catch (err) {
     console.error("Error initializing database:", err.message);
@@ -93,8 +105,13 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
         const expiresAt = new Date();
         expiresAt.setDate(expiresAt.getDate() + 30);
 
+        // Insert into licenses table
         const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at, revoked) VALUES (?, NULL, ?, 0)");
-        stmt.run(hashedKey, expiresAt.toISOString());
+        const result = stmt.run(hashedKey, expiresAt.toISOString());
+        
+        // Store plain key for admin reference
+        const keyRefStmt = db.prepare("INSERT INTO admin_license_keys (license_id, plain_key) VALUES (?, ?)");
+        keyRefStmt.run(result.lastInsertRowid, license_key);
 
         console.log("License key added successfully.");
         return res.json({ message: "License key added successfully", expires_at: expiresAt });
@@ -112,31 +129,43 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
     }
 
     try {
-        // Fetch all licenses
-        const stmt = db.prepare("SELECT * FROM licenses");
-        const licenses = stmt.all();
+        // First try to find in the admin_license_keys table for exact match
+        const adminKeyStmt = db.prepare("SELECT license_id FROM admin_license_keys WHERE plain_key = ?");
+        const adminKeyResult = adminKeyStmt.get(license_key);
         
-        let foundLicense = null;
+        let foundLicenseId = null;
         
-        // Find the license by comparing with bcrypt
-        for (const license of licenses) {
-            const isMatch = await bcrypt.compare(license_key, license.license_key);
-            if (isMatch) {
-                foundLicense = license;
-                break;
+        if (adminKeyResult) {
+            // Found exact match in admin table
+            foundLicenseId = adminKeyResult.license_id;
+        } else {
+            // Try bcrypt compare for all licenses (fallback)
+            const stmt = db.prepare("SELECT * FROM licenses");
+            const licenses = stmt.all();
+            
+            for (const license of licenses) {
+                const isMatch = await bcrypt.compare(license_key, license.license_key);
+                if (isMatch) {
+                    foundLicenseId = license.id;
+                    break;
+                }
             }
         }
         
-        if (!foundLicense) {
+        if (foundLicenseId === null) {
             return res.status(404).json({ message: "License not found" });
         }
+        
+        // Get the license details
+        const licenseStmt = db.prepare("SELECT * FROM licenses WHERE id = ?");
+        const foundLicense = licenseStmt.get(foundLicenseId);
         
         // Update the license to revoked status
         const revokedAt = new Date().toISOString();
         const updateStmt = db.prepare("UPDATE licenses SET revoked = 1, revoked_at = ? WHERE id = ?");
-        updateStmt.run(revokedAt, foundLicense.id);
+        updateStmt.run(revokedAt, foundLicenseId);
         
-        console.log(`⛔ License key revoked: ID ${foundLicense.id}`);
+        console.log(`⛔ License key revoked: ID ${foundLicenseId}`);
         return res.json({ message: "License revoked successfully" });
     } catch (error) {
         console.error("Error revoking license:", error);
@@ -235,10 +264,6 @@ app.post("/validate-license", async (req, res) => {
 // ✅ Get license monitoring information (Admin only)
 app.get("/monitor-licenses", verifyAdmin, async (req, res) => {
     try {
-        // Get all licenses from the database
-        const stmt = db.prepare("SELECT * FROM licenses");
-        const licenses = stmt.all();
-        
         // Update active status based on last active timestamp
         const inactiveThreshold = new Date();
         inactiveThreshold.setMinutes(inactiveThreshold.getMinutes() - 15); // 15 minutes of inactivity = offline
@@ -248,16 +273,18 @@ app.get("/monitor-licenses", verifyAdmin, async (req, res) => {
         );
         updateInactiveStmt.run(inactiveThreshold.toISOString());
         
-        // Get updated license data
+        // Get updated license data with plain keys from join
         const licenseDataStmt = db.prepare(`
-            SELECT id, license_key, 
-                   device_id, 
-                   expires_at, 
-                   revoked,
-                   last_active,
-                   active_status,
-                   device_count
-            FROM licenses
+            SELECT l.id, l.license_key, 
+                   l.device_id, 
+                   l.expires_at, 
+                   l.revoked,
+                   l.last_active,
+                   l.active_status,
+                   l.device_count,
+                   a.plain_key
+            FROM licenses l
+            LEFT JOIN admin_license_keys a ON l.id = a.license_id
         `);
         const licenseData = licenseDataStmt.all();
         
@@ -265,10 +292,6 @@ app.get("/monitor-licenses", verifyAdmin, async (req, res) => {
         const formattedLicenses = [];
         
         for (const license of licenseData) {
-            // Get the original (unhashed) key if available from a mapping or use masked version
-            const shortId = license.id.toString().padStart(4, '0');
-            const maskedKey = `key-${shortId}`;
-            
             // Calculate expiry
             const expiresAt = license.expires_at ? new Date(license.expires_at) : null;
             const now = new Date();
@@ -276,7 +299,7 @@ app.get("/monitor-licenses", verifyAdmin, async (req, res) => {
             
             formattedLicenses.push({
                 license_id: license.id,
-                license_key: maskedKey,
+                license_key: license.plain_key || `unknown-key-${license.id}`,
                 status: license.revoked === 1 ? "revoked" : 
                         isExpired ? "expired" :
                         license.active_status === 1 ? "online" : "offline",
