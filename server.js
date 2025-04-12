@@ -31,7 +31,10 @@ try {
             device_id TEXT,
             expires_at TEXT,
             revoked INTEGER DEFAULT 0,
-            revoked_at TEXT DEFAULT NULL
+            revoked_at TEXT DEFAULT NULL,
+            last_active TEXT DEFAULT NULL,
+            active_status INTEGER DEFAULT 0,
+            device_count INTEGER DEFAULT 0
         )
     `;
     db.prepare(createTableStmt).run();
@@ -141,7 +144,7 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
     }
 });
 
-// ✅ Validate License (Now checks for revocation)
+// ✅ Validate License (Now checks for revocation and updates activity status)
 app.post("/validate-license", async (req, res) => {
     const { license_key, device_id } = req.body;
     if (!license_key || !device_id) {
@@ -178,24 +181,186 @@ app.post("/validate-license", async (req, res) => {
             return res.status(403).json({ valid: false, message: "License expired" });
         }
 
+        // Update the last active timestamp and set status to active
+        const currentTime = new Date().toISOString();
+        const updateActivityStmt = db.prepare(
+            "UPDATE licenses SET last_active = ?, active_status = 1 WHERE id = ?"
+        );
+        updateActivityStmt.run(currentTime, validLicense.id);
+        console.log(`✅ License key activity updated: ID ${validLicense.id}`);
+
         // Prevent reuse on another device
         if (validLicense.device_id && validLicense.device_id !== device_id) {
+            // Increment device count if this is a new device
+            const updateDeviceCountStmt = db.prepare(
+                "UPDATE licenses SET device_count = device_count + 1 WHERE id = ?"
+            );
+            updateDeviceCountStmt.run(validLicense.id);
+            
             console.log(`⛔ License key already used on another device: ${validLicense.device_id}`);
-            return res.status(403).json({ valid: false, message: "License already in use by another device" });
+            return res.status(403).json({ 
+                valid: false, 
+                message: "License already in use by another device",
+                device_count: (validLicense.device_count || 0) + 1
+            });
         }
 
         // Bind the license to the first device that registers it
         if (!validLicense.device_id) {
-            const updateStmt = db.prepare("UPDATE licenses SET device_id = ? WHERE id = ?");
+            const updateStmt = db.prepare(
+                "UPDATE licenses SET device_id = ?, device_count = 1 WHERE id = ?"
+            );
             updateStmt.run(device_id, validLicense.id);
             console.log(`✅ License key bound to device: ${device_id}`);
-            return res.json({ valid: true, message: "License activated on this device", expires_at: validLicense.expires_at });
+            return res.json({ 
+                valid: true, 
+                message: "License activated on this device", 
+                expires_at: validLicense.expires_at,
+                device_count: 1
+            });
         }
 
-        return res.json({ valid: true, message: "License validated", expires_at: validLicense.expires_at });
+        return res.json({ 
+            valid: true, 
+            message: "License validated", 
+            expires_at: validLicense.expires_at,
+            device_count: validLicense.device_count || 1
+        });
     } catch (error) {
         console.error("Error during license validation:", error);
         return res.status(500).json({ valid: false, message: "Internal server error" });
+    }
+});
+
+// ✅ Get license monitoring information (Admin only)
+app.get("/monitor-licenses", verifyAdmin, async (req, res) => {
+    try {
+        // Get all licenses from the database
+        const stmt = db.prepare("SELECT * FROM licenses");
+        const licenses = stmt.all();
+        
+        // Update active status based on last active timestamp
+        const inactiveThreshold = new Date();
+        inactiveThreshold.setMinutes(inactiveThreshold.getMinutes() - 15); // 15 minutes of inactivity = offline
+        
+        const updateInactiveStmt = db.prepare(
+            "UPDATE licenses SET active_status = 0 WHERE last_active < ? OR last_active IS NULL"
+        );
+        updateInactiveStmt.run(inactiveThreshold.toISOString());
+        
+        // Get updated license data
+        const licenseDataStmt = db.prepare(`
+            SELECT id, license_key, 
+                   device_id, 
+                   expires_at, 
+                   revoked,
+                   last_active,
+                   active_status,
+                   device_count
+            FROM licenses
+        `);
+        const licenseData = licenseDataStmt.all();
+        
+        // Format data for display
+        const formattedLicenses = [];
+        
+        for (const license of licenseData) {
+            // Get the original (unhashed) key if available from a mapping or use masked version
+            const shortId = license.id.toString().padStart(4, '0');
+            const maskedKey = `key-${shortId}`;
+            
+            // Calculate expiry
+            const expiresAt = license.expires_at ? new Date(license.expires_at) : null;
+            const now = new Date();
+            const isExpired = expiresAt && expiresAt < now;
+            
+            formattedLicenses.push({
+                license_id: license.id,
+                license_key: maskedKey,
+                status: license.revoked === 1 ? "revoked" : 
+                        isExpired ? "expired" :
+                        license.active_status === 1 ? "online" : "offline",
+                device_id: license.device_id || "not_registered",
+                device_count: license.device_count || 0,
+                expires_at: license.expires_at,
+                last_active: license.last_active || "never",
+            });
+        }
+        
+        return res.json({
+            total_licenses: formattedLicenses.length,
+            active_count: formattedLicenses.filter(l => l.status === "online").length,
+            licenses: formattedLicenses
+        });
+    } catch (error) {
+        console.error("Error during license monitoring:", error);
+        return res.status(500).json({ message: "Internal server error" });
+    }
+});
+
+// ✅ Heartbeat endpoint to keep a license marked as active
+app.post("/license-heartbeat", async (req, res) => {
+    const { license_key, device_id } = req.body;
+    if (!license_key || !device_id) {
+        return res.status(400).json({ success: false, message: "Missing data" });
+    }
+
+    try {
+        // Find the license
+        const stmt = db.prepare("SELECT * FROM licenses");
+        const licenses = stmt.all();
+
+        let foundLicense = null;
+        for (const license of licenses) {
+            const isMatch = await bcrypt.compare(license_key, license.license_key);
+            if (isMatch) {
+                foundLicense = license;
+                break;
+            }
+        }
+
+        if (!foundLicense) {
+            return res.status(404).json({ success: false, message: "License not found" });
+        }
+        
+        // Check if license is revoked or expired
+        if (foundLicense.revoked === 1) {
+            return res.status(403).json({ 
+                success: false, 
+                message: "License has been revoked", 
+                revoked: true 
+            });
+        }
+        
+        if (new Date(foundLicense.expires_at) < new Date()) {
+            return res.status(403).json({ 
+                success: false, 
+                message: "License expired" 
+            });
+        }
+        
+        // Verify device_id matches or update it if not set
+        if (foundLicense.device_id && foundLicense.device_id !== device_id) {
+            return res.status(403).json({ 
+                success: false, 
+                message: "Device ID mismatch" 
+            });
+        }
+        
+        // Update last active timestamp
+        const currentTime = new Date().toISOString();
+        const updateStmt = db.prepare(
+            "UPDATE licenses SET last_active = ?, active_status = 1 WHERE id = ?"
+        );
+        updateStmt.run(currentTime, foundLicense.id);
+        
+        return res.json({ 
+            success: true, 
+            message: "Heartbeat received" 
+        });
+    } catch (error) {
+        console.error("Error during license heartbeat:", error);
+        return res.status(500).json({ success: false, message: "Internal server error" });
     }
 });
 
