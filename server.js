@@ -24,20 +24,84 @@ app.use(express.urlencoded({ extended: true }));
 const db = new sqlite3(DB_FILE);
 
 try {
-    const createTableStmt = `
+    // Create licenses table
+    const createLicenseTableStmt = `
         CREATE TABLE IF NOT EXISTS licenses (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             license_key TEXT NOT NULL,
             device_id TEXT,
+            device_type TEXT DEFAULT NULL,
+            ip_address TEXT DEFAULT NULL,
+            last_active TEXT DEFAULT NULL,
+            active_status TEXT DEFAULT 'Offline',
             expires_at TEXT,
             revoked INTEGER DEFAULT 0,
             revoked_at TEXT DEFAULT NULL
         )
     `;
-    db.prepare(createTableStmt).run();
+    db.prepare(createLicenseTableStmt).run();
+    
+    // Create device tracking table for multi-device support
+    const createDeviceTableStmt = `
+        CREATE TABLE IF NOT EXISTS device_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_id INTEGER NOT NULL,
+            device_id TEXT NOT NULL,
+            device_type TEXT DEFAULT 'Unknown',
+            ip_address TEXT,
+            first_used TEXT NOT NULL,
+            last_active TEXT NOT NULL,
+            active_status TEXT DEFAULT 'Offline',
+            FOREIGN KEY (license_id) REFERENCES licenses(id)
+        )
+    `;
+    db.prepare(createDeviceTableStmt).run();
+    
+    // Create activity log table
+    const createActivityLogStmt = `
+        CREATE TABLE IF NOT EXISTS activity_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            license_id INTEGER,
+            device_id TEXT,
+            ip_address TEXT,
+            action TEXT NOT NULL,
+            timestamp TEXT NOT NULL,
+            details TEXT
+        )
+    `;
+    db.prepare(createActivityLogStmt).run();
+    
     console.log("✅ Database initialized.");
 } catch (err) {
     console.error("Error initializing database:", err.message);
+}
+
+// Utility function to detect device type from user agent
+function detectDeviceType(userAgent) {
+    if (!userAgent) return 'Unknown';
+    
+    const ua = userAgent.toLowerCase();
+    
+    if (/(android|webos|iphone|ipad|ipod|blackberry|windows phone)/i.test(ua)) {
+        return 'Mobile';
+    } else if (/(tablet|ipad)/i.test(ua)) {
+        return 'Tablet';
+    } else {
+        return 'PC';
+    }
+}
+
+// Utility function to log activity
+function logActivity(licenseId, deviceId, ipAddress, action, details = null) {
+    try {
+        const stmt = db.prepare(`
+            INSERT INTO activity_log (license_id, device_id, ip_address, action, timestamp, details)
+            VALUES (?, ?, ?, ?, ?, ?)
+        `);
+        stmt.run(licenseId, deviceId, ipAddress, action, new Date().toISOString(), details);
+    } catch (error) {
+        console.error("Error logging activity:", error);
+    }
 }
 
 // Middleware to verify admin token
@@ -78,7 +142,7 @@ app.post("/admin-login", async (req, res) => {
     }
 });
 
-// ✅ Add license (Admin only)
+// Add license (Admin only)
 app.post("/add-license", verifyAdmin, async (req, res) => {
     const { license_key } = req.body;
     if (!license_key) {
@@ -91,17 +155,23 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
         expiresAt.setDate(expiresAt.getDate() + 30);
 
         const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at, revoked) VALUES (?, NULL, ?, 0)");
-        stmt.run(hashedKey, expiresAt.toISOString());
+        const result = stmt.run(hashedKey, expiresAt.toISOString());
 
+        logActivity(result.lastInsertRowid, null, req.ip, "License Created", `License key added with expiry: ${expiresAt.toISOString()}`);
+        
         console.log("License key added successfully.");
-        return res.json({ message: "License key added successfully", expires_at: expiresAt });
+        return res.json({ 
+            message: "License key added successfully", 
+            expires_at: expiresAt,
+            license_id: result.lastInsertRowid 
+        });
     } catch (error) {
         console.error("Error adding license:", error);
         return res.status(500).json({ message: "Error adding license" });
     }
 });
 
-// ✅ Revoke license (Admin only)
+// Revoke license (Admin only)
 app.post("/revoke-license", verifyAdmin, async (req, res) => {
     const { license_key } = req.body;
     if (!license_key) {
@@ -130,8 +200,14 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
         
         // Update the license to revoked status
         const revokedAt = new Date().toISOString();
-        const updateStmt = db.prepare("UPDATE licenses SET revoked = 1, revoked_at = ? WHERE id = ?");
+        const updateStmt = db.prepare("UPDATE licenses SET revoked = 1, revoked_at = ?, active_status = 'Revoked' WHERE id = ?");
         updateStmt.run(revokedAt, foundLicense.id);
+        
+        // Update all devices for this license to be offline
+        const updateDevicesStmt = db.prepare("UPDATE device_usage SET active_status = 'Revoked' WHERE license_id = ?");
+        updateDevicesStmt.run(foundLicense.id);
+        
+        logActivity(foundLicense.id, foundLicense.device_id, req.ip, "License Revoked", `License revoked at: ${revokedAt}`);
         
         console.log(`⛔ License key revoked: ID ${foundLicense.id}`);
         return res.json({ message: "License revoked successfully" });
@@ -141,9 +217,13 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
     }
 });
 
-// ✅ Validate License (Now checks for revocation)
+// Validate License (Now checks for revocation and tracks IP/device)
 app.post("/validate-license", async (req, res) => {
     const { license_key, device_id } = req.body;
+    const userAgent = req.headers['user-agent'];
+    const ipAddress = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    const deviceType = detectDeviceType(userAgent);
+    
     if (!license_key || !device_id) {
         return res.status(400).json({ valid: false, message: "Missing data" });
     }
@@ -169,33 +249,215 @@ app.post("/validate-license", async (req, res) => {
         
         // Check if license is revoked
         if (validLicense.revoked === 1) {
+            logActivity(validLicense.id, device_id, ipAddress, "Failed Validation", "License is revoked");
             console.log(`⛔ License key has been revoked at ${validLicense.revoked_at}`);
             return res.status(403).json({ valid: false, message: "License has been revoked", revoked: true });
         }
 
         // Check if license is expired
         if (new Date(validLicense.expires_at) < new Date()) {
+            logActivity(validLicense.id, device_id, ipAddress, "Failed Validation", "License is expired");
             return res.status(403).json({ valid: false, message: "License expired" });
         }
 
-        // Prevent reuse on another device
-        if (validLicense.device_id && validLicense.device_id !== device_id) {
-            console.log(`⛔ License key already used on another device: ${validLicense.device_id}`);
-            return res.status(403).json({ valid: false, message: "License already in use by another device" });
+        // Current timestamp
+        const now = new Date().toISOString();
+        
+        // Look for existing device records for this license and device
+        const deviceQuery = db.prepare("SELECT * FROM device_usage WHERE license_id = ? AND device_id = ?");
+        const existingDevice = deviceQuery.get(validLicense.id, device_id);
+        
+        // Check if this is a new device for this license
+        if (!existingDevice) {
+            // Count how many devices are already using this license
+            const deviceCountQuery = db.prepare("SELECT COUNT(*) as count FROM device_usage WHERE license_id = ?");
+            const { count } = deviceCountQuery.get(validLicense.id);
+            
+            // If this is the first device or the license doesn't have a device yet, update the license record
+            if (count === 0 || !validLicense.device_id) {
+                const updateLicenseStmt = db.prepare(`
+                    UPDATE licenses 
+                    SET device_id = ?, device_type = ?, ip_address = ?, last_active = ?, active_status = 'Online' 
+                    WHERE id = ?
+                `);
+                updateLicenseStmt.run(device_id, deviceType, ipAddress, now, validLicense.id);
+            }
+            
+            // Add the new device to device_usage table
+            const addDeviceStmt = db.prepare(`
+                INSERT INTO device_usage 
+                (license_id, device_id, device_type, ip_address, first_used, last_active, active_status) 
+                VALUES (?, ?, ?, ?, ?, ?, 'Online')
+            `);
+            addDeviceStmt.run(validLicense.id, device_id, deviceType, ipAddress, now, now);
+            
+            logActivity(validLicense.id, device_id, ipAddress, "New Device Registration", 
+                        `New device registered: ${deviceType} from IP: ${ipAddress}`);
+            
+            console.log(`✅ New device registered for license ${validLicense.id}: ${device_id} (${deviceType}) from ${ipAddress}`);
+        } else {
+            // Update existing device's last active time and IP address
+            const updateDeviceStmt = db.prepare(`
+                UPDATE device_usage 
+                SET last_active = ?, ip_address = ?, active_status = 'Online' 
+                WHERE license_id = ? AND device_id = ?
+            `);
+            updateDeviceStmt.run(now, ipAddress, validLicense.id, device_id);
+            
+            // Also update the main license record if this is the primary device
+            if (validLicense.device_id === device_id) {
+                const updateLicenseStmt = db.prepare(`
+                    UPDATE licenses 
+                    SET last_active = ?, ip_address = ?, active_status = 'Online' 
+                    WHERE id = ?
+                `);
+                updateLicenseStmt.run(now, ipAddress, validLicense.id);
+            }
+            
+            logActivity(validLicense.id, device_id, ipAddress, "License Validation", 
+                        `License validated for device: ${deviceType} from IP: ${ipAddress}`);
+            
+            console.log(`✅ Device ${device_id} validated for license ${validLicense.id} from ${ipAddress}`);
         }
+        
+        // Get the count of devices using this license
+        const deviceCountQuery = db.prepare("SELECT COUNT(*) as count FROM device_usage WHERE license_id = ?");
+        const { count: deviceCount } = deviceCountQuery.get(validLicense.id);
 
-        // Bind the license to the first device that registers it
-        if (!validLicense.device_id) {
-            const updateStmt = db.prepare("UPDATE licenses SET device_id = ? WHERE id = ?");
-            updateStmt.run(device_id, validLicense.id);
-            console.log(`✅ License key bound to device: ${device_id}`);
-            return res.json({ valid: true, message: "License activated on this device", expires_at: validLicense.expires_at });
-        }
-
-        return res.json({ valid: true, message: "License validated", expires_at: validLicense.expires_at });
+        return res.json({ 
+            valid: true, 
+            message: "License validated", 
+            expires_at: validLicense.expires_at,
+            device_count: deviceCount,
+            device_type: deviceType
+        });
     } catch (error) {
         console.error("Error during license validation:", error);
         return res.status(500).json({ valid: false, message: "Internal server error" });
+    }
+});
+
+// New endpoint to report device going offline
+app.post("/report-offline", async (req, res) => {
+    const { license_key, device_id } = req.body;
+    
+    if (!license_key || !device_id) {
+        return res.status(400).json({ success: false, message: "Missing data" });
+    }
+
+    try {
+        // Find the license
+        const stmt = db.prepare("SELECT * FROM licenses");
+        const licenses = stmt.all();
+        
+        let validLicense = null;
+        
+        for (const license of licenses) {
+            const isMatch = await bcrypt.compare(license_key, license.license_key);
+            if (isMatch) {
+                validLicense = license;
+                break;
+            }
+        }
+        
+        if (!validLicense) {
+            return res.status(404).json({ success: false, message: "License not found" });
+        }
+        
+        // Update device status to offline
+        const updateDeviceStmt = db.prepare(`
+            UPDATE device_usage 
+            SET active_status = 'Offline' 
+            WHERE license_id = ? AND device_id = ?
+        `);
+        updateDeviceStmt.run(validLicense.id, device_id);
+        
+        // If this is the primary device, update the license record too
+        if (validLicense.device_id === device_id) {
+            const updateLicenseStmt = db.prepare(`
+                UPDATE licenses 
+                SET active_status = 'Offline' 
+                WHERE id = ?
+            `);
+            updateLicenseStmt.run(validLicense.id);
+        }
+        
+        logActivity(validLicense.id, device_id, req.ip, "Device Offline", "Device reported offline");
+        
+        return res.json({ success: true, message: "Device status updated to offline" });
+    } catch (error) {
+        console.error("Error updating device status:", error);
+        return res.status(500).json({ success: false, message: "Internal server error" });
+    }
+});
+
+// New endpoint to list all licenses with details (Admin only)
+app.get("/list-licenses", verifyAdmin, (req, res) => {
+    try {
+        const stmt = db.prepare(`
+            SELECT l.id, l.license_key, l.device_id, l.device_type, l.ip_address, 
+                   l.last_active, l.active_status, l.expires_at, l.revoked, l.revoked_at,
+                   (SELECT COUNT(*) FROM device_usage WHERE license_id = l.id) as device_count
+            FROM licenses l
+            ORDER BY l.id DESC
+        `);
+        
+        const licenses = stmt.all();
+        
+        // We don't want to send the hashed keys to the frontend
+        const sanitizedLicenses = licenses.map(license => {
+            // Create a shallow copy without the license_key
+            const { license_key, ...sanitizedLicense } = license;
+            return sanitizedLicense;
+        });
+        
+        return res.json({ licenses: sanitizedLicenses });
+    } catch (error) {
+        console.error("Error fetching licenses:", error);
+        return res.status(500).json({ message: "Error fetching licenses" });
+    }
+});
+
+// New endpoint to get devices for a specific license (Admin only)
+app.get("/license-devices/:licenseId", verifyAdmin, (req, res) => {
+    const { licenseId } = req.params;
+    
+    try {
+        const stmt = db.prepare(`
+            SELECT id, device_id, device_type, ip_address, first_used, last_active, active_status
+            FROM device_usage
+            WHERE license_id = ?
+            ORDER BY last_active DESC
+        `);
+        
+        const devices = stmt.all(licenseId);
+        
+        return res.json({ devices });
+    } catch (error) {
+        console.error("Error fetching devices for license:", error);
+        return res.status(500).json({ message: "Error fetching devices" });
+    }
+});
+
+// New endpoint to get activity log for a license (Admin only)
+app.get("/license-activity/:licenseId", verifyAdmin, (req, res) => {
+    const { licenseId } = req.params;
+    
+    try {
+        const stmt = db.prepare(`
+            SELECT id, device_id, ip_address, action, timestamp, details
+            FROM activity_log
+            WHERE license_id = ?
+            ORDER BY timestamp DESC
+            LIMIT 100
+        `);
+        
+        const activities = stmt.all(licenseId);
+        
+        return res.json({ activities });
+    } catch (error) {
+        console.error("Error fetching activity log:", error);
+        return res.status(500).json({ message: "Error fetching activity log" });
     }
 });
 
