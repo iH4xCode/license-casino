@@ -32,7 +32,10 @@ try {
             expires_at TEXT,
             revoked INTEGER DEFAULT 0,
             revoked_at TEXT DEFAULT NULL,
-            license_type TEXT DEFAULT 'regular'
+            license_type TEXT DEFAULT 'regular',
+            device_type TEXT DEFAULT NULL,
+            ip_address TEXT DEFAULT NULL,
+            last_active TEXT DEFAULT NULL
         )
     `;
     db.prepare(createTableStmt).run();
@@ -53,18 +56,35 @@ try {
     `;
     db.prepare(createDeviceTableStmt).run();
     
-    // Add license_type column if it doesn't exist (for backward compatibility)
+    // Add missing columns if they don't exist (for backward compatibility)
     try {
         db.prepare("ALTER TABLE licenses ADD COLUMN license_type TEXT DEFAULT 'regular'").run();
-        console.log("✅ Added license_type column");
     } catch (err) {
-        // Column already exists, ignore error
-        console.log("✅ license_type column already exists");
+        // Column already exists
     }
     
-    console.log("✅ Database initialized.");
+    try {
+        db.prepare("ALTER TABLE licenses ADD COLUMN device_type TEXT DEFAULT NULL").run();
+    } catch (err) {
+        // Column already exists
+    }
+    
+    try {
+        db.prepare("ALTER TABLE licenses ADD COLUMN ip_address TEXT DEFAULT NULL").run();
+    } catch (err) {
+        // Column already exists
+    }
+    
+    try {
+        db.prepare("ALTER TABLE licenses ADD COLUMN last_active TEXT DEFAULT NULL").run();
+    } catch (err) {
+        // Column already exists
+    }
+    
+    console.log("✅ Database initialized successfully.");
 } catch (err) {
-    console.error("Error initializing database:", err.message);
+    console.error("❌ Error initializing database:", err.message);
+    process.exit(1);
 }
 
 // Utility function to detect device type from user agent
@@ -267,7 +287,10 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
 app.post("/check-license-status", async (req, res) => {
     const { license_key, device_id } = req.body;
     
+    console.log(`🔍 License status check: device_id=${device_id}`);
+    
     if (!license_key || !device_id) {
+        console.log(`❌ Missing data in status check: license_key=${!!license_key}, device_id=${!!device_id}`);
         return res.status(400).json({ valid: false, message: "Missing data" });
     }
 
@@ -279,19 +302,26 @@ app.post("/check-license-status", async (req, res) => {
         let validLicense = null;
 
         for (const license of licenses) {
-            const isMatch = await bcrypt.compare(license_key, license.license_key);
-            if (isMatch) {
-                validLicense = license;
-                break;
+            try {
+                const isMatch = await bcrypt.compare(license_key, license.license_key);
+                if (isMatch) {
+                    validLicense = license;
+                    break;
+                }
+            } catch (bcryptError) {
+                console.error(`Error comparing license ${license.id} in status check:`, bcryptError);
+                continue;
             }
         }
 
         if (!validLicense) {
+            console.log(`❌ No matching license found in status check`);
             return res.status(404).json({ valid: false, message: "License not found" });
         }
         
         // Check if license is revoked
         if (validLicense.revoked === 1) {
+            console.log(`⛔ License ${validLicense.id} is revoked in status check`);
             return res.status(403).json({ 
                 valid: false, 
                 message: "Your license key has been banned please contact @AngelFinn", 
@@ -300,7 +330,8 @@ app.post("/check-license-status", async (req, res) => {
         }
 
         // Check if license is expired
-        if (new Date(validLicense.expires_at) < new Date()) {
+        if (validLicense.expires_at && new Date(validLicense.expires_at) < new Date()) {
+            console.log(`⏰ License ${validLicense.id} is expired in status check`);
             return res.status(403).json({ 
                 valid: false, 
                 message: "License expired", 
@@ -308,6 +339,7 @@ app.post("/check-license-status", async (req, res) => {
             });
         }
 
+        console.log(`✅ License ${validLicense.id} status check passed`);
         return res.json({ 
             valid: true, 
             message: "License is active",
@@ -315,45 +347,63 @@ app.post("/check-license-status", async (req, res) => {
             license_type: validLicense.license_type || 'regular'
         });
     } catch (error) {
-        console.error("Error checking license status:", error);
-        return res.status(500).json({ valid: false, message: "Internal server error" });
+        console.error("❌ Error checking license status:", error);
+        console.error("Error stack:", error.stack);
+        return res.status(500).json({ 
+            valid: false, 
+            message: "Internal server error during status check",
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Server error'
+        });
     }
 });
 
 // ✅ Validate License (Enhanced with multi-device support for trials)
 app.post("/validate-license", async (req, res) => {
     const { license_key, device_id } = req.body;
-    const userAgent = req.headers['user-agent'];
-    const ipAddress = req.headers['x-forwarded-for'] || req.connection.remoteAddress;
+    const userAgent = req.headers['user-agent'] || 'Unknown';
+    const ipAddress = req.headers['x-forwarded-for'] || req.connection.remoteAddress || 'Unknown';
     const deviceType = detectDeviceType(userAgent);
     
+    console.log(`🔄 License validation request: device_id=${device_id}, ip=${ipAddress}`);
+    
     if (!license_key || !device_id) {
+        console.log(`❌ Missing data: license_key=${!!license_key}, device_id=${!!device_id}`);
         return res.status(400).json({ valid: false, message: "Missing data" });
     }
 
     try {
-        // Fetch the license directly from the database
+        // Fetch all licenses from database
         const stmt = db.prepare("SELECT * FROM licenses");
         const licenses = stmt.all();
+        
+        console.log(`📋 Found ${licenses.length} licenses in database`);
 
         let validLicense = null;
 
+        // Find matching license by comparing with bcrypt
         for (const license of licenses) {
-            const isMatch = await bcrypt.compare(license_key, license.license_key);
-            if (isMatch) {
-                validLicense = license;
-                break;
+            try {
+                const isMatch = await bcrypt.compare(license_key, license.license_key);
+                if (isMatch) {
+                    validLicense = license;
+                    console.log(`✅ Found matching license: ID ${license.id}, type=${license.license_type || 'regular'}`);
+                    break;
+                }
+            } catch (bcryptError) {
+                console.error(`Error comparing license ${license.id}:`, bcryptError);
+                continue;
             }
         }
 
         if (!validLicense) {
+            console.log(`❌ No matching license found for provided key`);
             return res.status(404).json({ valid: false, message: "License is invalid" });
         }
         
         // Check if license is revoked
         if (validLicense.revoked === 1) {
             logActivity(validLicense.id, device_id, ipAddress, "Failed Validation", "License is revoked");
-            console.log(`⛔ License key has been revoked at ${validLicense.revoked_at}`);
+            console.log(`⛔ License ${validLicense.id} is revoked (revoked_at: ${validLicense.revoked_at})`);
             return res.status(403).json({ 
                 valid: false, 
                 message: "Your license key has been banned please contact @AngelFinn", 
@@ -362,8 +412,9 @@ app.post("/validate-license", async (req, res) => {
         }
 
         // Check if license is expired
-        if (new Date(validLicense.expires_at) < new Date()) {
+        if (validLicense.expires_at && new Date(validLicense.expires_at) < new Date()) {
             logActivity(validLicense.id, device_id, ipAddress, "Failed Validation", "License is expired");
+            console.log(`⏰ License ${validLicense.id} is expired (expires_at: ${validLicense.expires_at})`);
             return res.status(403).json({ 
                 valid: false, 
                 message: "License expired", 
@@ -372,77 +423,110 @@ app.post("/validate-license", async (req, res) => {
         }
 
         const now = new Date().toISOString();
+        const licenseType = validLicense.license_type || 'regular';
+        
+        console.log(`🔍 Processing ${licenseType} license validation for device: ${device_id}`);
         
         // DIFFERENT LOGIC FOR REGULAR VS TRIAL LICENSES
-        if (validLicense.license_type === 'trial') {
+        if (licenseType === 'trial') {
             // TRIAL LICENSE: ALLOW MULTIPLE DEVICES
-            console.log(`🔄 Processing trial license validation for device: ${device_id}`);
+            console.log(`🎯 Processing trial license validation`);
             
-            // Check if this device is already registered for this license
-            const deviceQuery = db.prepare("SELECT * FROM device_usage WHERE license_id = ? AND device_id = ?");
-            const existingDevice = deviceQuery.get(validLicense.id, device_id);
-            
-            if (!existingDevice) {
-                // New device for this trial license - add it
-                const addDeviceStmt = db.prepare(`
-                    INSERT INTO device_usage 
-                    (license_id, device_id, device_type, ip_address, first_used, last_active, active_status) 
-                    VALUES (?, ?, ?, ?, ?, ?, 'Online')
-                `);
-                addDeviceStmt.run(validLicense.id, device_id, deviceType, ipAddress, now, now);
+            try {
+                // Check if this device is already registered for this license
+                const deviceQuery = db.prepare("SELECT * FROM device_usage WHERE license_id = ? AND device_id = ?");
+                const existingDevice = deviceQuery.get(validLicense.id, device_id);
                 
-                logActivity(validLicense.id, device_id, ipAddress, "New Device Registration", 
-                           `Trial license: New device registered: ${deviceType} from IP: ${ipAddress}`);
+                if (!existingDevice) {
+                    // New device for this trial license - add it
+                    console.log(`➕ Adding new device ${device_id} for trial license ${validLicense.id}`);
+                    
+                    const addDeviceStmt = db.prepare(`
+                        INSERT INTO device_usage 
+                        (license_id, device_id, device_type, ip_address, first_used, last_active, active_status) 
+                        VALUES (?, ?, ?, ?, ?, ?, 'Online')
+                    `);
+                    addDeviceStmt.run(validLicense.id, device_id, deviceType, ipAddress, now, now);
+                    
+                    logActivity(validLicense.id, device_id, ipAddress, "New Device Registration", 
+                               `Trial license: New device registered: ${deviceType} from IP: ${ipAddress}`);
+                    
+                    console.log(`✅ Trial license: New device registered successfully`);
+                } else {
+                    // Update existing device's last active time
+                    console.log(`🔄 Updating existing device ${device_id} for trial license ${validLicense.id}`);
+                    
+                    const updateDeviceStmt = db.prepare(`
+                        UPDATE device_usage 
+                        SET last_active = ?, ip_address = ?, active_status = 'Online', device_type = ?
+                        WHERE license_id = ? AND device_id = ?
+                    `);
+                    updateDeviceStmt.run(now, ipAddress, deviceType, validLicense.id, device_id);
+                    
+                    logActivity(validLicense.id, device_id, ipAddress, "License Validation", 
+                               `Trial license: Device validated: ${deviceType} from IP: ${ipAddress}`);
+                    
+                    console.log(`✅ Trial license: Device updated successfully`);
+                }
                 
-                console.log(`✅ Trial license: New device registered for license ${validLicense.id}: ${device_id} (${deviceType})`);
-            } else {
-                // Update existing device's last active time
-                const updateDeviceStmt = db.prepare(`
-                    UPDATE device_usage 
-                    SET last_active = ?, ip_address = ?, active_status = 'Online' 
-                    WHERE license_id = ? AND device_id = ?
-                `);
-                updateDeviceStmt.run(now, ipAddress, validLicense.id, device_id);
+                // Update main license record with latest activity (using first device or current device)
+                if (!validLicense.device_id) {
+                    console.log(`🔄 Updating main license record with device info`);
+                    const updateLicenseStmt = db.prepare(`
+                        UPDATE licenses 
+                        SET device_id = ?, device_type = ?, ip_address = ?, last_active = ? 
+                        WHERE id = ?
+                    `);
+                    updateLicenseStmt.run(device_id, deviceType, ipAddress, now, validLicense.id);
+                }
                 
-                logActivity(validLicense.id, device_id, ipAddress, "License Validation", 
-                           `Trial license: Device validated: ${deviceType} from IP: ${ipAddress}`);
+                // Get device count for this license
+                const deviceCountQuery = db.prepare("SELECT COUNT(*) as count FROM device_usage WHERE license_id = ?");
+                const deviceCountResult = deviceCountQuery.get(validLicense.id);
+                const deviceCount = deviceCountResult ? deviceCountResult.count : 1;
                 
-                console.log(`✅ Trial license: Device ${device_id} validated for license ${validLicense.id}`);
-            }
-            
-            // Update main license record with latest activity (using first device or current device)
-            if (!validLicense.device_id) {
-                const updateLicenseStmt = db.prepare(`
+                console.log(`📊 Trial license ${validLicense.id} has ${deviceCount} active devices`);
+                
+                return res.json({ 
+                    valid: true, 
+                    message: "Trial license validated (multi-device)", 
+                    expires_at: validLicense.expires_at,
+                    license_type: 'trial',
+                    device_count: deviceCount,
+                    device_limit: 'unlimited',
+                    device_type: deviceType
+                });
+                
+            } catch (trialError) {
+                console.error(`Error processing trial license:`, trialError);
+                // Fallback: treat as single device if device_usage table fails
+                const updateStmt = db.prepare(`
                     UPDATE licenses 
                     SET device_id = ?, device_type = ?, ip_address = ?, last_active = ? 
                     WHERE id = ?
                 `);
-                updateLicenseStmt.run(device_id, deviceType, ipAddress, now, validLicense.id);
+                updateStmt.run(device_id, deviceType, ipAddress, now, validLicense.id);
+                
+                return res.json({ 
+                    valid: true, 
+                    message: "Trial license validated", 
+                    expires_at: validLicense.expires_at,
+                    license_type: 'trial',
+                    device_count: 1,
+                    device_limit: 'unlimited',
+                    device_type: deviceType
+                });
             }
-            
-            // Get device count for this license
-            const deviceCountQuery = db.prepare("SELECT COUNT(*) as count FROM device_usage WHERE license_id = ?");
-            const { count: deviceCount } = deviceCountQuery.get(validLicense.id);
-            
-            return res.json({ 
-                valid: true, 
-                message: "Trial license validated (multi-device)", 
-                expires_at: validLicense.expires_at,
-                license_type: 'trial',
-                device_count: deviceCount,
-                device_limit: 'unlimited',
-                device_type: deviceType
-            });
             
         } else {
             // REGULAR LICENSE: SINGLE DEVICE ONLY (original logic)
-            console.log(`🔄 Processing regular license validation for device: ${device_id}`);
+            console.log(`🎯 Processing regular license validation`);
             
             // Prevent reuse on another device
             if (validLicense.device_id && validLicense.device_id !== device_id) {
                 logActivity(validLicense.id, device_id, ipAddress, "Failed Validation", 
                            `Regular license: Device mismatch. License bound to: ${validLicense.device_id}`);
-                console.log(`⛔ Regular license already used on another device: ${validLicense.device_id}`);
+                console.log(`⛔ Regular license already bound to different device: ${validLicense.device_id}`);
                 return res.status(403).json({ 
                     valid: false, 
                     message: "License already in use by another device" 
@@ -451,13 +535,18 @@ app.post("/validate-license", async (req, res) => {
 
             // Bind the license to the first device that registers it
             if (!validLicense.device_id) {
-                const updateStmt = db.prepare("UPDATE licenses SET device_id = ?, device_type = ?, ip_address = ?, last_active = ? WHERE id = ?");
+                console.log(`🔗 Binding regular license ${validLicense.id} to device ${device_id}`);
+                const updateStmt = db.prepare(`
+                    UPDATE licenses 
+                    SET device_id = ?, device_type = ?, ip_address = ?, last_active = ? 
+                    WHERE id = ?
+                `);
                 updateStmt.run(device_id, deviceType, ipAddress, now, validLicense.id);
                 
                 logActivity(validLicense.id, device_id, ipAddress, "Device Binding", 
                            `Regular license: Bound to device: ${deviceType} from IP: ${ipAddress}`);
                 
-                console.log(`✅ Regular license bound to device: ${device_id}`);
+                console.log(`✅ Regular license bound to device successfully`);
                 return res.json({ 
                     valid: true, 
                     message: "License activated on this device", 
@@ -469,13 +558,19 @@ app.post("/validate-license", async (req, res) => {
                 });
             }
 
-            // Update last active time for existing device
-            const updateStmt = db.prepare("UPDATE licenses SET last_active = ?, ip_address = ? WHERE id = ?");
-            updateStmt.run(now, ipAddress, validLicense.id);
+            // Update last active time for existing bound device
+            console.log(`🔄 Updating activity for bound device ${device_id}`);
+            const updateStmt = db.prepare(`
+                UPDATE licenses 
+                SET last_active = ?, ip_address = ?, device_type = ? 
+                WHERE id = ?
+            `);
+            updateStmt.run(now, ipAddress, deviceType, validLicense.id);
             
             logActivity(validLicense.id, device_id, ipAddress, "License Validation", 
                        `Regular license: Validated for bound device: ${deviceType}`);
 
+            console.log(`✅ Regular license validated successfully`);
             return res.json({ 
                 valid: true, 
                 message: "License validated", 
@@ -487,8 +582,15 @@ app.post("/validate-license", async (req, res) => {
             });
         }
     } catch (error) {
-        console.error("Error during license validation:", error);
-        return res.status(500).json({ valid: false, message: "Internal server error" });
+        console.error("❌ Error during license validation:", error);
+        console.error("Error stack:", error.stack);
+        
+        // Return detailed error for debugging
+        return res.status(500).json({ 
+            valid: false, 
+            message: "Internal server error during validation",
+            error: process.env.NODE_ENV === 'development' ? error.message : 'Server error'
+        });
     }
 });
 
