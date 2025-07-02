@@ -31,10 +31,21 @@ try {
             device_id TEXT,
             expires_at TEXT,
             revoked INTEGER DEFAULT 0,
-            revoked_at TEXT DEFAULT NULL
+            revoked_at TEXT DEFAULT NULL,
+            license_type TEXT DEFAULT 'regular'
         )
     `;
     db.prepare(createTableStmt).run();
+    
+    // Add license_type column if it doesn't exist (for backward compatibility)
+    try {
+        db.prepare("ALTER TABLE licenses ADD COLUMN license_type TEXT DEFAULT 'regular'").run();
+        console.log("✅ Added license_type column");
+    } catch (err) {
+        // Column already exists, ignore error
+        console.log("✅ license_type column already exists");
+    }
+    
     console.log("✅ Database initialized.");
 } catch (err) {
     console.error("Error initializing database:", err.message);
@@ -55,6 +66,21 @@ function verifyAdmin(req, res, next) {
         res.status(400).json({ message: "Invalid token." });
     }
 }
+
+// Test endpoint to verify server is working
+app.get("/", (req, res) => {
+    res.json({ 
+        message: "License Server is running", 
+        endpoints: [
+            "POST /admin-login",
+            "POST /add-license", 
+            "POST /add-license-trial",
+            "POST /revoke-license",
+            "POST /validate-license",
+            "POST /check-license-status"
+        ]
+    });
+});
 
 // Admin login to get a token
 app.post("/admin-login", async (req, res) => {
@@ -78,7 +104,7 @@ app.post("/admin-login", async (req, res) => {
     }
 });
 
-// ✅ Add license (Admin only)
+// ✅ Add regular license (Admin only)
 app.post("/add-license", verifyAdmin, async (req, res) => {
     const { license_key } = req.body;
     if (!license_key) {
@@ -88,16 +114,51 @@ app.post("/add-license", verifyAdmin, async (req, res) => {
     try {
         const hashedKey = await bcrypt.hash(license_key, 10);
         const expiresAt = new Date();
-        expiresAt.setDate(expiresAt.getDate() + 30);
+        expiresAt.setDate(expiresAt.getDate() + 30); // 30 days for regular license
 
-        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at, revoked) VALUES (?, NULL, ?, 0)");
-        stmt.run(hashedKey, expiresAt.toISOString());
+        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at, revoked, license_type) VALUES (?, NULL, ?, 0, 'regular')");
+        const result = stmt.run(hashedKey, expiresAt.toISOString());
 
-        console.log("License key added successfully.");
-        return res.json({ message: "License key added successfully", expires_at: expiresAt });
+        console.log("✅ Regular license key added successfully.");
+        return res.json({ 
+            message: "Regular license key added successfully", 
+            expires_at: expiresAt,
+            license_id: result.lastInsertRowid,
+            license_type: 'regular'
+        });
     } catch (error) {
         console.error("Error adding license:", error);
         return res.status(500).json({ message: "Error adding license" });
+    }
+});
+
+// ✅ Add trial license (Admin only) - THIS IS THE MISSING ENDPOINT
+app.post("/add-license-trial", verifyAdmin, async (req, res) => {
+    console.log("🔄 Trial license creation request received");
+    const { license_key } = req.body;
+    
+    if (!license_key) {
+        return res.status(400).json({ message: "License key required" });
+    }
+
+    try {
+        const hashedKey = await bcrypt.hash(license_key, 10);
+        const expiresAt = new Date();
+        expiresAt.setDate(expiresAt.getDate() + 2); // 2 days for trial license
+
+        const stmt = db.prepare("INSERT INTO licenses (license_key, device_id, expires_at, revoked, license_type) VALUES (?, NULL, ?, 0, 'trial')");
+        const result = stmt.run(hashedKey, expiresAt.toISOString());
+
+        console.log("✅ Trial license key added successfully.");
+        return res.json({ 
+            message: "Trial license key added successfully", 
+            expires_at: expiresAt,
+            license_id: result.lastInsertRowid,
+            license_type: 'trial'
+        });
+    } catch (error) {
+        console.error("❌ Error adding trial license:", error);
+        return res.status(500).json({ message: "Error adding trial license" });
     }
 });
 
@@ -109,8 +170,8 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
     }
 
     try {
-        // Fetch all licenses
-        const stmt = db.prepare("SELECT * FROM licenses");
+        // Fetch all non-revoked licenses
+        const stmt = db.prepare("SELECT * FROM licenses WHERE revoked = 0");
         const licenses = stmt.all();
         
         let foundLicense = null;
@@ -125,7 +186,7 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
         }
         
         if (!foundLicense) {
-            return res.status(404).json({ message: "License not found" });
+            return res.status(404).json({ message: "License not found or already revoked" });
         }
         
         // Update the license to revoked status
@@ -134,14 +195,75 @@ app.post("/revoke-license", verifyAdmin, async (req, res) => {
         updateStmt.run(revokedAt, foundLicense.id);
         
         console.log(`⛔ License key revoked: ID ${foundLicense.id}`);
-        return res.json({ message: "License revoked successfully" });
+        return res.json({ 
+            message: "License revoked successfully",
+            license_id: foundLicense.id,
+            revoked_at: revokedAt
+        });
     } catch (error) {
         console.error("Error revoking license:", error);
         return res.status(500).json({ message: "Error revoking license" });
     }
 });
 
-// ✅ Validate License (Now checks for revocation)
+// ✅ Check license status (for periodic checks)
+app.post("/check-license-status", async (req, res) => {
+    const { license_key, device_id } = req.body;
+    
+    if (!license_key || !device_id) {
+        return res.status(400).json({ valid: false, message: "Missing data" });
+    }
+
+    try {
+        // Fetch all licenses
+        const stmt = db.prepare("SELECT * FROM licenses");
+        const licenses = stmt.all();
+
+        let validLicense = null;
+
+        for (const license of licenses) {
+            const isMatch = await bcrypt.compare(license_key, license.license_key);
+            if (isMatch) {
+                validLicense = license;
+                break;
+            }
+        }
+
+        if (!validLicense) {
+            return res.status(404).json({ valid: false, message: "License not found" });
+        }
+        
+        // Check if license is revoked
+        if (validLicense.revoked === 1) {
+            return res.status(403).json({ 
+                valid: false, 
+                message: "Your license key has been banned please contact @AngelFinn", 
+                revoked: true 
+            });
+        }
+
+        // Check if license is expired
+        if (new Date(validLicense.expires_at) < new Date()) {
+            return res.status(403).json({ 
+                valid: false, 
+                message: "License expired", 
+                expired: true 
+            });
+        }
+
+        return res.json({ 
+            valid: true, 
+            message: "License is active",
+            expires_at: validLicense.expires_at,
+            license_type: validLicense.license_type || 'regular'
+        });
+    } catch (error) {
+        console.error("Error checking license status:", error);
+        return res.status(500).json({ valid: false, message: "Internal server error" });
+    }
+});
+
+// ✅ Validate License
 app.post("/validate-license", async (req, res) => {
     const { license_key, device_id } = req.body;
     if (!license_key || !device_id) {
@@ -170,12 +292,16 @@ app.post("/validate-license", async (req, res) => {
         // Check if license is revoked
         if (validLicense.revoked === 1) {
             console.log(`⛔ License key has been revoked at ${validLicense.revoked_at}`);
-            return res.status(403).json({ valid: false, message: "License has been revoked", revoked: true });
+            return res.status(403).json({ 
+                valid: false, 
+                message: "Your license key has been banned please contact @AngelFinn", 
+                revoked: true 
+            });
         }
 
         // Check if license is expired
         if (new Date(validLicense.expires_at) < new Date()) {
-            return res.status(403).json({ valid: false, message: "License expired" });
+            return res.status(403).json({ valid: false, message: "License expired", expired: true });
         }
 
         // Prevent reuse on another device
@@ -189,10 +315,20 @@ app.post("/validate-license", async (req, res) => {
             const updateStmt = db.prepare("UPDATE licenses SET device_id = ? WHERE id = ?");
             updateStmt.run(device_id, validLicense.id);
             console.log(`✅ License key bound to device: ${device_id}`);
-            return res.json({ valid: true, message: "License activated on this device", expires_at: validLicense.expires_at });
+            return res.json({ 
+                valid: true, 
+                message: "License activated on this device", 
+                expires_at: validLicense.expires_at,
+                license_type: validLicense.license_type || 'regular'
+            });
         }
 
-        return res.json({ valid: true, message: "License validated", expires_at: validLicense.expires_at });
+        return res.json({ 
+            valid: true, 
+            message: "License validated", 
+            expires_at: validLicense.expires_at,
+            license_type: validLicense.license_type || 'regular'
+        });
     } catch (error) {
         console.error("Error during license validation:", error);
         return res.status(500).json({ valid: false, message: "Internal server error" });
@@ -202,4 +338,12 @@ app.post("/validate-license", async (req, res) => {
 // Start server
 app.listen(PORT, () => {
     console.log(`✅ Server running on http://localhost:${PORT}`);
+    console.log(`📋 Available endpoints:`);
+    console.log(`   GET  / - Server info`);
+    console.log(`   POST /admin-login - Admin authentication`);
+    console.log(`   POST /add-license - Add regular license (30 days)`);
+    console.log(`   POST /add-license-trial - Add trial license (2 days)`);
+    console.log(`   POST /revoke-license - Revoke license`);
+    console.log(`   POST /validate-license - Validate license`);
+    console.log(`   POST /check-license-status - Check license status`);
 });
